@@ -1,0 +1,26 @@
+{
+  "organizations": [
+    {
+      "slug": "weing-dev",
+      "baseUrl": "https://sentry.io",
+      "projects": [
+        "orta-client",
+        "orta-cms"
+      ],
+      "environments": ["production"],
+      "query": "is:unresolved"
+    },
+    {
+      "slug": "weing-lloyd",
+      "baseUrl": "https://sentry.io",
+      "projects": [
+        "dore_demo"
+      ],
+      "environments": ["production"],
+      "query": "is:unresolved"
+    }
+  ],
+  "levels": ["error", "fatal"],
+  "ignoreContains": [],
+  "ignoredIssueIds": []
+}
