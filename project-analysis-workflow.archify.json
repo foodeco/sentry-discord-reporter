@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Sentry 프로젝트 원인 분석·문서화 흐름",
+    "subtitle": "오류 수집부터 배포 소스 근거 확인, 프로젝트별 Markdown, Discord 알림까지",
+    "output": "project-analysis-workflow.html",
+    "animation": "none",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "triage_path",
+        "label": "수집과 노이즈 제거",
+        "focus": ["schedule", "fetch_events", "cluster_errors"],
+        "note": "예약 또는 수동 실행에서 새 오류 군집만 선별합니다."
+      },
+      {
+        "id": "source_path",
+        "label": "프로젝트 소스 대조",
+        "focus": ["resolve_project", "source_analysis"],
+        "note": "Sentry release와 로컬 저장소를 안전한 읽기 전용 스냅샷으로 대조합니다."
+      },
+      {
+        "id": "delivery_path",
+        "label": "문서와 알림",
+        "focus": ["publish_report"],
+        "note": "근거가 있는 원인·조치 문서를 남기고 Discord에는 요약만 보냅니다."
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "trigger", "label": "실행" },
+    { "id": "sentry", "label": "Sentry 수집" },
+    { "id": "triage_lane", "label": "정규화·군집화" },
+    { "id": "source", "label": "프로젝트 매핑" },
+    { "id": "analysis", "label": "Codex 분석" },
+    { "id": "output", "label": "문서·알림" }
+  ],
+  "phases": [
+    { "id": "collect", "label": "수집", "fromCol": 0, "toCol": 1 },
+    { "id": "triage", "label": "정규화·매핑", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "explain", "label": "소스 분석·전달", "fromCol": 4, "toCol": 5, "variant": "security" }
+  ],
+  "mainPath": [
+    "schedule",
+    "fetch_events",
+    "cluster_errors",
+    "resolve_project",
+    "source_analysis",
+    "publish_report"
+  ],
+  "nodes": [
+    {
+      "id": "schedule",
+      "lane": "trigger",
+      "col": 0,
+      "type": "external",
+      "label": "예약·수동",
+      "sublabel": "09 · 14 · 20시"
+    },
+    {
+      "id": "fetch_events",
+      "lane": "sentry",
+      "col": 1,
+      "type": "cloud",
+      "label": "Sentry 수집",
+      "sublabel": "이슈·이벤트"
+    },
+    {
+      "id": "cluster_errors",
+      "lane": "triage_lane",
+      "col": 2,
+      "type": "backend",
+      "label": "오류 군집화",
+      "sublabel": "예외 + 첫 앱 프레임"
+    },
+    {
+      "id": "resolve_project",
+      "lane": "source",
+      "col": 3,
+      "type": "database",
+      "label": "프로젝트 매핑",
+      "sublabel": "org/project → repo"
+    },
+    {
+      "id": "source_analysis",
+      "lane": "analysis",
+      "col": 4,
+      "type": "backend",
+      "label": "소스 분석",
+      "sublabel": "SHA · 호출자 · 테스트",
+      "tag": "read-only"
+    },
+    {
+      "id": "publish_report",
+      "lane": "output",
+      "col": 5,
+      "type": "messagebus",
+      "label": "문서·Discord",
+      "sublabel": "담당자 검토"
+    }
+  ],
+  "edges": [
+    { "from": "schedule", "to": "fetch_events", "role": "main", "variant": "emphasis" },
+    { "from": "fetch_events", "to": "cluster_errors", "role": "main", "route": "outside-right" },
+    { "from": "cluster_errors", "to": "resolve_project", "role": "main", "variant": "emphasis" },
+    { "from": "resolve_project", "to": "source_analysis", "role": "main", "variant": "security" },
+    { "from": "source_analysis", "to": "publish_report", "role": "main", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "확인된 프로젝트 매핑",
+      "items": [
+        "weing-dev/orta-client → ../orta",
+        "weing-dev/orta-cms → ../orta-cms",
+        "weing-lloyd/dore_demo → ../dore"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "문서 품질 기준",
+      "items": [
+        "관측 사실과 추정 원인을 분리",
+        "파일·심볼·호출자 근거가 없으면 단정 금지",
+        "즉시 조치·코드 수정·검증·모니터링을 구분"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "자동화 경계",
+      "items": [
+        "문서와 알림까지만 자동 생성",
+        "프로젝트 코드 수정과 Git 작업은 하지 않음",
+        "release SHA가 없으면 현재 HEAD 기준임을 표시"
+      ]
+    }
+  ]
+}

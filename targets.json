@@ -20,6 +20,11 @@
       "query": "is:unresolved"
     }
   ],
+  "sourceRoots": {
+    "weing-dev/orta-client": "../orta",
+    "weing-dev/orta-cms": "../orta-cms",
+    "weing-lloyd/dore_demo": "../dore"
+  },
   "levels": ["error", "fatal"],
   "ignoreContains": [],
   "ignoredIssueIds": []

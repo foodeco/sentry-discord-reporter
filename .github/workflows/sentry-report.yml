@@ -39,8 +39,17 @@ jobs:
           SENTRY_TOKENS_JSON: ${{ secrets.SENTRY_TOKENS_JSON }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_CLI_ANALYSIS: "0"
           OPENAI_MODEL: gpt-5.6-luna
           MAX_ISSUES_PER_RUN: "30"
           LOOKBACK_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_hours || '' }}
           REPORT_SLOT: ${{ github.event.schedule == '0 9 * * *' && '09' || github.event.schedule == '0 14 * * *' && '14' || github.event.schedule == '0 20 * * *' && '20' || '' }}
         run: node report.mjs
+      - name: Keep project reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sentry-reports-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -7,7 +7,11 @@ import {
   computeWindow,
   extractEventContext,
   normalizeConfig,
+  renderProjectIndex,
+  renderProjectMarkdown,
+  renderReport,
   selectIssues,
+  stackFrames,
 } from "./report.mjs";
 
 test("09시 예약은 전날 20시부터 당일 09시까지 조회한다", () => {
@@ -70,4 +74,96 @@ test("AI로 보낼 이벤트 문맥에서 인증값과 이메일을 마스킹한
 
   assert.doesNotMatch(context, /top\.secret\.value|user@example\.com|hunter2/);
   assert.match(context, /\[REDACTED\]|\[EMAIL\]/);
+});
+
+test("Sentry 스택 경로를 커밋 소스 경로와 줄 번호로 정규화한다", () => {
+  const frames = stackFrames({
+    eventContext: "- E:\\weing_repo\\api\\src\\client.ts:42 getOne | await request()\n- webpack-internal:///(rsc)/./src/app/page.tsx:9 Page",
+  });
+
+  assert.deepEqual(frames, [
+    { path: "src/client.ts", line: 42, symbol: "getOne" },
+    { path: "src/app/page.tsx", line: 9, symbol: "Page" },
+  ]);
+});
+
+test("AI 분석 결과를 원인과 조치로 구분해 Discord에 표시한다", () => {
+  const organization = { slug: "weing" };
+  const issue = {
+    __organization: organization,
+    id: "1",
+    shortId: "API-1",
+    project: { slug: "api" },
+    title: "Database unavailable",
+    level: "error",
+    count: "3",
+    userCount: 2,
+    lastSeen: "2026-08-22T02:00:00Z",
+    permalink: "https://sentry.io/issues/1",
+  };
+  const analysis = {
+    mode: "Codex CLI (ChatGPT)",
+    summary: "DB 연결 오류",
+    issues: [{
+      issueKey: "weing:1",
+      priority: "P1",
+      noise: false,
+      reason: "신규 오류",
+      analysis: "연결 풀이 고갈된 것으로 추정됩니다.",
+      nextAction: "풀 사용량을 확인하고 누수를 수정한 뒤 부하 테스트하세요.",
+    }],
+  };
+  const window = { start: new Date("2026-08-22T00:00:00Z"), end: new Date("2026-08-22T03:00:00Z") };
+
+  const report = renderReport([issue], analysis, window).join("\n");
+
+  assert.match(report, /원인: 연결 풀이 고갈/);
+  assert.match(report, /조치: 풀 사용량을 확인/);
+});
+
+test("프로젝트별 Markdown에 현황, 원인, 조치와 Sentry 링크를 종합한다", () => {
+  const organization = { slug: "weing" };
+  const issue = {
+    __organization: organization,
+    id: "1",
+    shortId: "API-1",
+    project: { slug: "api" },
+    title: "Database unavailable",
+    level: "error",
+    count: "8",
+    userCount: 3,
+    firstSeen: "2026-08-22T01:00:00Z",
+    lastSeen: "2026-08-22T02:00:00Z",
+    permalink: "https://sentry.io/issues/1",
+  };
+  const result = {
+    key: "weing/api",
+    organization: "weing",
+    project: "api",
+    issues: [issue],
+    sourceRoot: "../api",
+    analysis: {
+      mode: "Codex CLI + source@1234567",
+      sourceCommit: "1234567890abcdef",
+      summary: "DB 연결 실패가 집중 발생했습니다.",
+      issues: [{
+        issueKey: "weing:1",
+        priority: "P1",
+        noise: false,
+        reason: "영향 사용자 3명",
+        analysis: "src/db.ts의 connect 호출에서 풀이 고갈된 것으로 추정됩니다.",
+        nextAction: "풀 사용량을 확인하고 복구 테스트를 실행하세요.",
+      }],
+    },
+  };
+  const window = { start: new Date("2026-08-22T00:00:00Z"), end: new Date("2026-08-22T03:00:00Z") };
+
+  const report = renderProjectMarkdown(result, window);
+  const index = renderProjectIndex([result], window);
+
+  assert.match(report, /보고 1건.*P1 1.*누적 이벤트 8건/);
+  assert.match(report, /추정 원인: src\/db\.ts/);
+  assert.match(report, /권장 조치: 풀 사용량/);
+  assert.match(report, /\[API-1\]\(https:\/\/sentry\.io\/issues\/1\)/);
+  assert.match(index, /\.\/weing__api\.md/);
 });

@@ -6,18 +6,19 @@
 
 - Sentry 조직 2곳과 프로젝트 3곳의 이슈·최신 이벤트 조회 검증 완료
 - Discord Webhook 조회·실제 메시지 전송 검증 완료
-- 수동 실행 및 규칙 기반 분석 가능
+- 수동 실행 및 로컬 Codex AI 원인·조치 분석 가능
+- 프로젝트별 Markdown 인덱스·상세 분석 문서 생성
 - GitHub Actions 예약: 매일 09:00, 14:00, 20:00 KST
-- 로컬 ChatGPT/Codex 계정을 이용한 AI 분석과 Windows 예약 작업 등록은 아직 미완료
+- Windows 예약 작업 등록은 아직 미완료
 
-OpenAI API 키가 있으면 AI 분석을 사용하고, 없거나 호출에 실패하면 규칙 기반 리포트로 동작합니다. 현재 로그인된 ChatGPT/Codex 계정은 GitHub-hosted Actions에서 그대로 사용할 수 없습니다.
+OpenAI API 키가 있으면 Responses API를 우선 사용합니다. 키가 없거나 호출에 실패하면 로그인된 로컬 Codex CLI로 원인과 조치를 분석하고, 두 방법 모두 사용할 수 없을 때만 규칙 기반 리포트로 동작합니다. 현재 로그인된 ChatGPT/Codex 계정은 GitHub-hosted Actions에서 그대로 사용할 수 없습니다.
 
 ## 요구 사항
 
 - Node.js 22 이상
 - 조직별 Sentry Auth Token
 - Discord Incoming Webhook URL
-- 선택: OpenAI API Key
+- 선택: ChatGPT로 로그인한 Codex CLI 또는 OpenAI API Key
 
 외부 npm 패키지와 상시 실행 서버는 필요하지 않습니다.
 
@@ -38,7 +39,9 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.6-luna
+CODEX_CLI_ANALYSIS=1
 MAX_ISSUES_PER_RUN=30
+REPORTS_DIR=reports
 DRY_RUN=0
 ```
 
@@ -82,6 +85,11 @@ Discord 채널의 **채널 편집 → 연동 → 웹후크 → 새 웹후크 →
       "query": "is:unresolved"
     }
   ],
+  "sourceRoots": {
+    "my-organization/web": "../web",
+    "my-organization/admin": "../admin",
+    "my-organization/api": "../api"
+  },
   "levels": ["error", "fatal"],
   "ignoreContains": ["무시할 오류 문구"],
   "ignoredIssueIds": ["PROJECT-123"]
@@ -92,6 +100,9 @@ Discord 채널의 **채널 편집 → 연동 → 웹후크 → 새 웹후크 →
 - 프로젝트 slug: **Settings → Projects → 프로젝트 → General Settings**에서 확인
 - 환경 이름: Issues 화면의 Environment 필터에서 확인
 - US/DE 리전 또는 Self-hosted 사용 시 `baseUrl`을 해당 API 호스트로 변경
+- `sourceRoots`: 선택 사항. `조직-slug/프로젝트-slug`를 키로 하고 이 저장소 기준 소스 경로를 값으로 지정
+
+`sourceRoots`가 연결된 로컬 실행은 Sentry 스택과 일치하는 현재 `HEAD`의 코드 구간만 Git으로 추출·마스킹해 분석 입력에 포함합니다. 소스 저장소의 미커밋 파일은 읽거나 수정하지 않습니다.
 
 ## 실행
 
@@ -123,6 +134,8 @@ Remove-Item Env:DRY_RUN
 
 프로세스 환경변수는 `.env`보다 우선합니다.
 
+실행할 때마다 `reports/YYYY-MM-DD/HHmm/index.md`와 프로젝트별 상세 문서가 생성됩니다. 인덱스에는 프로젝트별 P0~P3, 노이즈, 이벤트 수와 요약이 표시되고, 상세 문서에는 각 이슈의 관측 사실·추정 원인·권장 조치·Sentry 링크가 기록됩니다. `REPORTS_DIR`로 출력 루트를 바꿀 수 있습니다.
+
 ## 예약 실행
 
 ### GitHub Actions
@@ -144,9 +157,11 @@ Remove-Item Env:DRY_RUN
 
 Actions 화면의 **Run workflow**로 예약 시간 외 수동 실행도 가능합니다.
 
+GitHub-hosted Actions에는 로컬의 ChatGPT 로그인과 형제 소스 저장소가 없으므로, 기본 설정에서는 OpenAI API 또는 규칙 기반 분석을 사용합니다. 생성 문서를 Actions에서 보관하려면 워크플로의 artifact 업로드 단계를 사용합니다.
+
 ### 로컬 Windows
 
-항상 켜져 있는 Windows 장비라면 작업 스케줄러에서 `npm start`를 09:00, 14:00, 20:00에 실행할 수 있습니다. 이 방식은 `.env`와 로컬 Codex 로그인을 사용할 수 있지만, 현재 저장소에는 영구 작업 등록과 Codex CLI 분석 연결이 아직 추가되지 않았습니다.
+항상 켜져 있는 Windows 장비라면 작업 스케줄러에서 `npm start`를 09:00, 14:00, 20:00에 실행할 수 있습니다. 이 방식은 `.env`와 `codex login`으로 로그인한 ChatGPT 계정을 사용합니다. Codex 분석을 끄려면 `CODEX_CLI_ANALYSIS=0`으로 설정합니다. 현재 저장소에는 영구 작업 등록만 아직 추가되지 않았습니다.
 
 ## 원격 저장소
 
@@ -169,6 +184,7 @@ git push -u origin main
 - `ignoredIssueIds`에 등록한 이슈 제거
 - 이메일, Bearer/JWT, password/token/api key 형태 마스킹
 - 예외 메시지, 애플리케이션 스택 프레임과 허용된 태그만 길이를 제한해 분석
+- 로컬 Codex는 비밀 환경변수를 전달하지 않고 Sentry 스택과 연결된 커밋 소스 구간만 조사
 - AI 분석 실패 시 규칙 기반 리포트로 전환
 
 ## 테스트
