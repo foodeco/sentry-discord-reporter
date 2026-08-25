@@ -8,6 +8,7 @@ const PROJECT_DIR = fileURLToPath(new URL(".", import.meta.url));
 const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
 const DEFAULT_LEVELS = ["error", "fatal"];
 const DEFAULT_MAX_ISSUES = 30;
+const SENTRY_FETCH_LIMIT = 100;
 const DISCORD_MESSAGE_LIMIT = 1900;
 const CODEX_TIMEOUT_MS = 5 * 60 * 1000;
 const ANALYSIS_INSTRUCTIONS = [
@@ -17,6 +18,7 @@ const ANALYSIS_INSTRUCTIONS = [
   "동일 이슈는 입력 issueKey를 그대로 유지하세요.",
   "analysis에는 예외 메시지와 애플리케이션 스택을 근거로 추정 원인을 쓰고, 근거가 부족하면 확인 불가라고 명시하세요.",
   "nextAction에는 즉시 확인할 위치, 수정 방향, 수정 후 검증 방법을 구체적으로 쓰세요.",
+  "degraded_mode=true는 호출자가 명시적 폴백으로 처리한 오류입니다. 별도의 렌더 실패 근거가 없으면 P1으로 분류하지 마세요.",
   "일시적 네트워크/브라우저 확장/봇/이미 알려진 무해 오류라는 근거가 충분할 때만 noise=true로 분류하세요.",
   "P0는 전체 장애·데이터 손실·보안 사고, P1은 신규/재발 고영향 오류, P2는 일반 운영 오류, P3는 낮은 영향으로 분류하세요.",
 ];
@@ -292,12 +294,27 @@ export function extractEventContext(event) {
     }
   }
 
-  const allowedTags = new Set(["environment", "release", "transaction", "level", "runtime", "browser", "os"]);
+  const allowedTags = new Set([
+    "environment", "release", "transaction", "level", "runtime", "browser", "os",
+    "api_source", "error_code", "degraded_mode", "dependency", "fallback",
+  ]);
   const tags = (event.tags || [])
     .map((tag) => Array.isArray(tag) ? { key: tag[0], value: tag[1] } : tag)
     .filter((tag) => allowedTags.has(tag.key))
     .map((tag) => `${tag.key}=${tag.value}`);
   if (tags.length) parts.push(`Tags: ${tags.join(", ")}`);
+
+  const api = event.contexts?.api;
+  if (api && typeof api === "object") {
+    const endpoint = String(api.endpoint || "").replace(/[?#].*$/, "");
+    const details = [
+      api.source ? `source=${api.source}` : null,
+      endpoint ? `endpoint=${endpoint}` : null,
+      api.statusCode ? `status=${api.statusCode}` : null,
+      api.transportCode ? `transport=${api.transportCode}` : null,
+    ].filter(Boolean);
+    if (details.length) parts.push(`API: ${details.join(", ")}`);
+  }
 
   return redact(parts.join("\n")).slice(0, 3500);
 }
@@ -346,16 +363,21 @@ function isRegression(issue) {
   return /regress/.test(`${issue.substatus || ""} ${JSON.stringify(issue.statusDetails || {})}`.toLowerCase());
 }
 
+function usesFallback(issue) {
+  return /\bdegraded_mode=true\b/i.test(String(issue.eventContext || ""));
+}
+
 function rulePriority(issue, window) {
   if (String(issue.level).toLowerCase() === "fatal") return "P0";
+  if (usesFallback(issue)) return "P2";
   if (String(issue.priority).toLowerCase() === "high" || isRegression(issue) || Date.parse(issue.firstSeen) >= window.start.getTime()) return "P1";
   if (String(issue.level).toLowerCase() === "error") return "P2";
   return "P3";
 }
 
-function ruleResult(issue, window) {
+export function ruleResult(issue, window) {
   const isNew = Date.parse(issue.firstSeen) >= window.start.getTime();
-  const reason = [isNew ? "신규" : null, isRegression(issue) ? "재발" : null, issue.level, `누적 ${issue.count || 0}건`]
+  const reason = [isNew ? "신규" : null, isRegression(issue) ? "재발" : null, usesFallback(issue) ? "폴백 처리" : null, issue.level, `구간 ${issue.count || 0}건`]
     .filter(Boolean)
     .join(" · ");
   return {
@@ -418,7 +440,7 @@ function safeIssue(issue) {
     substatus: issue.substatus,
     firstSeen: issue.firstSeen,
     lastSeen: issue.lastSeen,
-    totalEventCount: Number(issue.count || 0),
+    windowEventCount: Number(issue.count || 0),
     affectedUserCount: Number(issue.userCount || 0),
     eventContext: issue.eventContext,
   };
@@ -743,7 +765,7 @@ export function renderProjectMarkdown(result, window) {
   const view = projectView(result);
   const overview = view.visible.length
     ? [
-        "| 우선순위 | 이슈 | 제목 | 누적 이벤트 | 영향 사용자 | 최근 발생 | 판단 |",
+        "| 우선순위 | 이슈 | 제목 | 구간 이벤트 | 영향 사용자 | 최근 발생 | 판단 |",
         "|---|---|---|---:|---:|---|---|",
         ...view.visible.map((item) => {
           const issue = view.issueByKey.get(item.issueKey);
@@ -757,7 +779,7 @@ export function renderProjectMarkdown(result, window) {
     return [
       `### ${item.priority} · ${issueReference(issue)} · ${markdownText(issue.title, 180)}`,
       "",
-      `- 관측: ${markdownText(issue.level || "error", 30)} · 누적 ${Number(issue.count) || 0}건 · 영향 사용자 ${Number(issue.userCount) || 0}명`,
+      `- 관측: ${markdownText(issue.level || "error", 30)} · 구간 ${Number(issue.count) || 0}건 · 영향 사용자 ${Number(issue.userCount) || 0}명`,
       `- 최초 발생: ${formatKst(new Date(issue.firstSeen))} KST`,
       `- 최근 발생: ${formatKst(new Date(issue.lastSeen))} KST`,
       "",
@@ -795,7 +817,7 @@ export function renderProjectMarkdown(result, window) {
     "",
     "## 현황",
     "",
-    `**보고 ${view.visible.length}건** · P0 ${view.priorities.P0} · P1 ${view.priorities.P1} · P2 ${view.priorities.P2} · P3 ${view.priorities.P3} · 노이즈 ${view.noise.length}건 · 누적 이벤트 ${view.eventCount}건 · 영향 사용자 합계 ${view.userCount}명`,
+    `**보고 ${view.visible.length}건** · P0 ${view.priorities.P0} · P1 ${view.priorities.P1} · P2 ${view.priorities.P2} · P3 ${view.priorities.P3} · 노이즈 ${view.noise.length}건 · 구간 이벤트 ${view.eventCount}건 · 영향 사용자 합계 ${view.userCount}명`,
     "",
     "## 우선순위 개요",
     "",
@@ -824,7 +846,7 @@ export function renderProjectIndex(results, window) {
     "",
     `조회 기간: ${formatKst(window.start)} ~ ${formatKst(window.end)} KST`,
     "",
-    `프로젝트 ${results.length}개 · 보고 ${totals.visible}건 · 노이즈 ${totals.noise}건 · 누적 이벤트 ${totals.events}건`,
+    `프로젝트 ${results.length}개 · 보고 ${totals.visible}건 · 노이즈 ${totals.noise}건 · 구간 이벤트 ${totals.events}건`,
     "",
     "| 프로젝트 | 보고 | P0 | P1 | P2 | P3 | 노이즈 | 분석 방식 | 요약 |",
     "|---|---:|---:|---:|---:|---:|---:|---|---|",
@@ -887,7 +909,7 @@ export function renderReport(issues, analysis, window) {
         return [
           `**[${item.priority}] ${issue.shortId || issue.id}**`,
           oneLine(issue.title, 220),
-          `관측: ${issue.level || "error"} · 누적 ${issue.count || 0}건 · 영향 사용자 ${issue.userCount || 0}명 · 마지막 ${formatKst(new Date(issue.lastSeen))}`,
+          `관측: ${issue.level || "error"} · 구간 ${issue.count || 0}건 · 영향 사용자 ${issue.userCount || 0}명 · 마지막 ${formatKst(new Date(issue.lastSeen))}`,
           `판단: ${oneLine(item.reason, 240)}`,
           `원인: ${oneLine(item.analysis, 320)}`,
           `조치: ${oneLine(item.nextAction, 240)}`,
@@ -928,7 +950,8 @@ export async function main(env = process.env) {
   const window = computeWindow({ slot: env.REPORT_SLOT, lookbackHours: env.LOOKBACK_HOURS });
   const tokenConfig = parseTokens(env, config.organizations.length);
   const groups = await Promise.all(config.organizations.map((organization) =>
-    fetchOrganizationIssues(organization, tokenFor(organization, tokenConfig), window, config.maxIssues),
+    // Sentry가 limit을 로컬 레벨·노이즈 필터보다 먼저 적용하므로 최대 한 페이지를 확보한다.
+    fetchOrganizationIssues(organization, tokenFor(organization, tokenConfig), window, SENTRY_FETCH_LIMIT),
   ));
   const issues = selectIssues(groups.flat(), config, window);
   const enriched = await enrichIssues(issues, tokenConfig);

@@ -10,6 +10,7 @@ import {
   renderProjectIndex,
   renderProjectMarkdown,
   renderReport,
+  ruleResult,
   selectIssues,
   stackFrames,
 } from "./report.mjs";
@@ -70,10 +71,27 @@ test("AI로 보낼 이벤트 문맥에서 인증값과 이메일을 마스킹한
     title: "Authorization: Bearer top.secret.value",
     message: "user@example.com password=hunter2",
     entries: [],
+    tags: [
+      ["degraded_mode", "true"],
+      ["dependency", "translatable-banner"],
+      ["fallback", "empty-list"],
+      ["ignored", "value"],
+    ],
+    contexts: {
+      api: {
+        source: "ortaclinic",
+        endpoint: "/api/banners?token=secret",
+        statusCode: 502,
+        transportCode: "ERR_BAD_RESPONSE",
+      },
+    },
   });
 
   assert.doesNotMatch(context, /top\.secret\.value|user@example\.com|hunter2/);
   assert.match(context, /\[REDACTED\]|\[EMAIL\]/);
+  assert.match(context, /degraded_mode=true.*dependency=translatable-banner.*fallback=empty-list/);
+  assert.match(context, /API: source=ortaclinic, endpoint=\/api\/banners, status=502, transport=ERR_BAD_RESPONSE/);
+  assert.doesNotMatch(context, /ignored=value|token=secret/);
 });
 
 test("Sentry 스택 경로를 커밋 소스 경로와 줄 번호로 정규화한다", () => {
@@ -85,6 +103,21 @@ test("Sentry 스택 경로를 커밋 소스 경로와 줄 번호로 정규화한
     { path: "src/client.ts", line: 42, symbol: "getOne" },
     { path: "src/app/page.tsx", line: 9, symbol: "Page" },
   ]);
+});
+
+test("명시적 폴백으로 처리된 신규 오류를 P2로 분류한다", () => {
+  const window = { start: new Date("2026-08-22T00:00:00Z"), end: new Date("2026-08-22T03:00:00Z") };
+  const result = ruleResult({
+    __organization: { slug: "weing" },
+    id: "1",
+    level: "error",
+    firstSeen: "2026-08-22T01:00:00Z",
+    count: "3",
+    eventContext: "Tags: degraded_mode=true, dependency=translatable-banner, fallback=empty-list",
+  }, window);
+
+  assert.equal(result.priority, "P2");
+  assert.match(result.reason, /신규.*폴백 처리.*구간 3건/);
 });
 
 test("AI 분석 결과를 원인과 조치로 구분해 Discord에 표시한다", () => {
@@ -161,7 +194,7 @@ test("프로젝트별 Markdown에 현황, 원인, 조치와 Sentry 링크를 종
   const report = renderProjectMarkdown(result, window);
   const index = renderProjectIndex([result], window);
 
-  assert.match(report, /보고 1건.*P1 1.*누적 이벤트 8건/);
+  assert.match(report, /보고 1건.*P1 1.*구간 이벤트 8건/);
   assert.match(report, /추정 원인: src\/db\.ts/);
   assert.match(report, /권장 조치: 풀 사용량/);
   assert.match(report, /\[API-1\]\(https:\/\/sentry\.io\/issues\/1\)/);
