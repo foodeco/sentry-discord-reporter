@@ -113,7 +113,7 @@ export function computeWindow({ slot, lookbackHours, now = new Date() } = {}) {
     return { start: new Date(now.getTime() - hours * 60 * 60 * 1000), end: now, kind: `최근 ${hours}시간` };
   }
 
-  if (!["09", "14", "20"].includes(slot)) {
+  if (!["09", "20"].includes(slot)) {
     return { start: new Date(now.getTime() - 24 * 60 * 60 * 1000), end: now, kind: "최근 24시간" };
   }
 
@@ -125,7 +125,7 @@ export function computeWindow({ slot, lookbackHours, now = new Date() } = {}) {
   const end = kstInstant(year, month, day, hour);
   const start = hour === 9
     ? kstInstant(year, month, day - 1, 20)
-    : kstInstant(year, month, day, hour === 14 ? 9 : 14);
+    : kstInstant(year, month, day, 9);
 
   // ponytail: DB 없이 고정 예약 구간을 사용한다. 실행 누락 자동 복구가 필요해질 때 체크포인트 저장소를 추가한다.
   return { start, end, kind: `${slot}:00 예약 구간` };

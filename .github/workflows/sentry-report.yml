@@ -10,8 +10,6 @@ on:
   schedule:
     - cron: "0 9 * * *"
       timezone: "Asia/Seoul"
-    - cron: "0 14 * * *"
-      timezone: "Asia/Seoul"
     - cron: "0 20 * * *"
       timezone: "Asia/Seoul"
 
@@ -43,7 +41,7 @@ jobs:
           OPENAI_MODEL: gpt-5.6-luna
           MAX_ISSUES_PER_RUN: "30"
           LOOKBACK_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_hours || '' }}
-          REPORT_SLOT: ${{ github.event.schedule == '0 9 * * *' && '09' || github.event.schedule == '0 14 * * *' && '14' || github.event.schedule == '0 20 * * *' && '20' || '' }}
+          REPORT_SLOT: ${{ github.event.schedule == '0 9 * * *' && '09' || github.event.schedule == '0 20 * * *' && '20' || '' }}
         run: node report.mjs
       - name: Keep project reports
         if: always()

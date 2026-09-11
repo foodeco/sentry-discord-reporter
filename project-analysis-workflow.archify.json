@@ -57,7 +57,7 @@
       "col": 0,
       "type": "external",
       "label": "예약·수동",
-      "sublabel": "09 · 14 · 20시"
+      "sublabel": "09 · 20시"
     },
     {
       "id": "fetch_events",

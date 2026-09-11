@@ -21,6 +21,12 @@ test("09시 예약은 전날 20시부터 당일 09시까지 조회한다", () =>
   assert.equal(window.end.toISOString(), "2026-08-22T00:00:00.000Z");
 });
 
+test("20시 예약은 당일 09시부터 20시까지 조회한다", () => {
+  const window = computeWindow({ slot: "20", now: new Date("2026-08-22T11:05:00.000Z") });
+  assert.equal(window.start.toISOString(), "2026-08-22T00:00:00.000Z");
+  assert.equal(window.end.toISOString(), "2026-08-22T11:00:00.000Z");
+});
+
 test("한 조직의 여러 프로젝트와 환경을 한 Sentry 요청에 넣는다", () => {
   const organization = {
     slug: "weing",

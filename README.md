@@ -8,7 +8,7 @@
 - Discord Webhook 조회·실제 메시지 전송 검증 완료
 - 수동 실행 및 로컬 Codex AI 원인·조치 분석 가능
 - 프로젝트별 Markdown 인덱스·상세 분석 문서 생성
-- GitHub Actions 예약: 매일 09:00, 14:00, 20:00 KST
+- GitHub Actions 예약: 매일 09:00, 20:00 KST
 - Windows 예약 작업 등록은 아직 미완료
 
 OpenAI API 키가 있으면 Responses API를 우선 사용합니다. 키가 없거나 호출에 실패하면 로그인된 로컬 Codex CLI로 원인과 조치를 분석하고, 두 방법 모두 사용할 수 없을 때만 규칙 기반 리포트로 동작합니다. 현재 로그인된 ChatGPT/Codex 계정은 GitHub-hosted Actions에서 그대로 사용할 수 없습니다.
@@ -143,8 +143,9 @@ Remove-Item Env:DRY_RUN
 `.github/workflows/sentry-report.yml`은 다음 시각에 실행됩니다.
 
 - 09:00 KST
-- 14:00 KST
 - 20:00 KST
+
+09시 보고는 전날 20시부터 당일 09시까지, 20시 보고는 당일 09시부터 20시까지 조회합니다.
 
 원격 저장소의 **Settings → Secrets and variables → Actions**에 다음 Repository Secret을 등록합니다.
 
@@ -161,7 +162,7 @@ GitHub-hosted Actions에는 로컬의 ChatGPT 로그인과 형제 소스 저장�
 
 ### 로컬 Windows
 
-항상 켜져 있는 Windows 장비라면 작업 스케줄러에서 `npm start`를 09:00, 14:00, 20:00에 실행할 수 있습니다. 이 방식은 `.env`와 `codex login`으로 로그인한 ChatGPT 계정을 사용합니다. Codex 분석을 끄려면 `CODEX_CLI_ANALYSIS=0`으로 설정합니다. 현재 저장소에는 영구 작업 등록만 아직 추가되지 않았습니다.
+항상 켜져 있는 Windows 장비라면 작업 스케줄러에서 `npm start`를 09:00, 20:00에 실행할 수 있습니다. 이 방식은 `.env`와 `codex login`으로 로그인한 ChatGPT 계정을 사용합니다. Codex 분석을 끄려면 `CODEX_CLI_ANALYSIS=0`으로 설정합니다. 현재 저장소에는 영구 작업 등록만 아직 추가되지 않았습니다.
 
 ## 원격 저장소
 
