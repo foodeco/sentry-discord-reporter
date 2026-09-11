@@ -11,10 +11,21 @@
       "query": "is:unresolved"
     },
     {
-      "slug": "weing-lloyd",
+      "slug": "weing-dev",
       "baseUrl": "https://sentry.io",
       "projects": [
-        "dore_demo"
+        "dore-client",
+        "dore-cms"
+      ],
+      "environments": ["production"],
+      "query": "is:unresolved"
+    },
+    {
+      "slug": "weing-dev",
+      "baseUrl": "https://sentry.io",
+      "projects": [
+        "naya-client",
+        "naya-admin"
       ],
       "environments": ["production"],
       "query": "is:unresolved"
@@ -23,7 +34,10 @@
   "sourceRoots": {
     "weing-dev/orta-client": "../orta",
     "weing-dev/orta-cms": "../orta-cms",
-    "weing-lloyd/dore_demo": "../dore"
+    "weing-dev/dore-client": "../dore",
+    "weing-dev/dore-cms": "../dore-cms",
+    "weing-dev/naya-client": "../naya",
+    "weing-dev/naya-admin": "../naya-admin"
   },
   "levels": ["error", "fatal"],
   "ignoreContains": [],
