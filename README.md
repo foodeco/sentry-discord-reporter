@@ -4,10 +4,10 @@
 
 ## 현재 상태
 
-- Sentry 조직 2곳과 프로젝트 3곳의 이슈·최신 이벤트 조회 검증 완료
+- Sentry 이슈·조회 구간 이벤트 목록·대표 이벤트 원문 조회
 - Discord Webhook 조회·실제 메시지 전송 검증 완료
 - 수동 실행 및 로컬 Codex AI 원인·조치 분석 가능
-- 프로젝트별 Markdown 인덱스·상세 분석 문서 생성
+- 프로젝트별 Markdown에 이벤트 분포·응답 오류·스택·Breadcrumbs·Trace/소스맵 진단 수록
 - GitHub Actions 예약: 매일 09:00, 20:00 KST
 - Windows 예약 작업 등록은 아직 미완료
 
@@ -55,7 +55,7 @@ DRY_RUN=0
 
 1. **Organization Settings → Custom Integrations**로 이동합니다.
 2. Internal Integration을 생성하거나 선택합니다.
-3. 최소한 **Issue & Event: Read** 권한을 설정하고 저장합니다.
+3. **Issue & Event: Read**를 설정합니다. Trace 조회에는 **Organization: Read**, 소스맵 진단에는 **Project: Read**도 설정하고 저장합니다.
 4. 화면의 **New Token**을 눌러 Auth Token을 생성합니다.
 5. 생성된 Token을 `SENTRY_TOKENS_JSON`의 해당 조직 slug에 입력합니다.
 
@@ -104,6 +104,8 @@ Discord 채널의 **채널 편집 → 연동 → 웹후크 → 새 웹후크 →
 
 `sourceRoots`가 연결된 로컬 실행은 Sentry 스택과 일치하는 현재 `HEAD`의 코드 구간만 Git으로 추출·마스킹해 분석 입력에 포함합니다. 소스 저장소의 미커밋 파일은 읽거나 수정하지 않습니다.
 
+모노레포는 해당 앱 디렉터리를 지정합니다. 현재 도레는 로컬 `weing-admin-mono`(origin: `weing-front/weing-medical`)의 `apps/dore-client`, `apps/dore-admin`에 연결되어 있습니다. Sentry `release`와 로컬 `HEAD`가 다르면 배포 당시 코드와의 추가 대조가 필요합니다.
+
 ## 실행
 
 ### 즉시 Discord 전송
@@ -135,6 +137,28 @@ Remove-Item Env:DRY_RUN
 프로세스 환경변수는 `.env`보다 우선합니다.
 
 실행할 때마다 `reports/YYYY-MM-DD/HHmm/index.md`와 프로젝트별 상세 문서가 생성됩니다. 인덱스에는 프로젝트별 P0~P3, 노이즈, 이벤트 수와 요약이 표시되고, 상세 문서에는 각 이슈의 관측 사실·추정 원인·권장 조치·Sentry 링크가 기록됩니다. `REPORTS_DIR`로 출력 루트를 바꿀 수 있습니다.
+
+### 상세 근거 수집
+
+리포트 조회 구간의 이벤트를 페이지 단위로 읽습니다. 이슈의 대표 제목과 전체 건수만으로 오류 유형을 판단하지 않습니다. 예를 들어 제목이 `status code 500`인 그룹 안에 `404 warning 35건 + 500 error 1건`이 있으면 두 유형의 건수를 따로 표시합니다. 구간 밖의 `events/latest/`는 사용하지 않습니다.
+
+보고 대상의 레벨 조건은 Sentry 검색 `level:[error,fatal]`처럼 구간 이벤트에 적용합니다. 그룹의 대표 레벨이 나중에 warning으로 바뀌어도 구간 안의 error가 누락되지 않습니다. 신규 여부는 전체 이력의 `lifetime.firstSeen`을 우선 사용하고 구간 첫 발생과 구분합니다. 조직 설정당 이슈 최대 100건을 조회하고 `MAX_ISSUES_PER_RUN`(기본 30)만큼 우선순위에 따라 보고하므로, 전체 점검에는 이 값을 100까지 늘릴 수 있습니다.
+
+| API | 리포트에 포함되는 근거 | 읽기 권한 |
+|---|---|---|
+| [Issue Events](https://docs.sentry.io/api/events/list-an-issues-events/) | 구간별 레벨·메시지, 메서드, 경로, 릴리스, 브라우저, 집중 시각 | `event:read` |
+| [Issue Event](https://docs.sentry.io/api/events/retrieve-an-issue-event/) | 예외·스택, API 상태/전송 코드, locale, 응답 오류 code/message/detail, 요청, 통신·이동 Breadcrumbs, SDK, Trace/Replay 링크 | `event:read` |
+| [Trace](https://docs.sentry.io/api/discover/retrieve-a-trace/) | 반환된 span과 연결 오류 수, 오래 걸린 span의 프로젝트·연산·시간 | `org:read` |
+| [Source Map Debug](https://docs.sentry.io/api/events/get-debug-information-related-to-source-maps-for-a-given-event/) | debug ID·artifact bundle·release artifact 유무, 대응 소스맵이 없는 프레임 수 | `project:read` |
+
+- 이슈당 이벤트 목록 최대 1,000건, 대표 원문 최대 5건을 조회합니다. 원문은 레벨·메시지 유형, 메서드, 릴리스, 경로, 브라우저 순으로 다른 사례를 선택합니다. 비율은 대표 원문이 아닌 확보한 이벤트 목록에서 계산합니다.
+- 분포는 상위 8종, 스택은 예외당 마지막 12프레임, 통신·이동 Breadcrumbs는 마지막 8건까지 표시합니다. 원문 발췌는 이벤트당 8,000자, AI 입력은 대표 이벤트당 2,500자까지입니다. 잘린 경우 표시합니다.
+- Trace와 소스맵 추가 진단은 첫 대표 이벤트에 적용합니다. 소스맵 진단은 Sentry의 JavaScript 처리 오류가 있을 때 호출합니다. 다른 대표 이벤트에도 Trace/Replay 연결 ID가 있으면 링크를 제공합니다.
+- API 오류·권한 부족·수집 한도·이벤트 수 불일치를 문서에 남깁니다. Trace 403은 데이터가 없다는 뜻이 아닙니다. 같은 조직의 Trace 403 이후 추가 호출은 생략합니다.
+- AI 분석에 실패해도 수집 근거를 Markdown에 보존합니다. 노이즈로 분류된 이슈도 상세 근거를 남깁니다. Discord에는 오류 유형별 분포를 요약합니다.
+- 폴백 처리 건수는 구간 전체 이벤트 태그에서 계산하며, 일부 표본의 폴백 태그만으로 전체 이슈의 우선순위를 낮추지 않습니다. 로컬 소스 연결은 AI 입력 길이에 잘리지 않은 대표 이벤트 발췌를 사용합니다.
+
+API는 Sentry에 이미 저장된 데이터를 조회합니다. 백엔드의 어느 DB 쿼리나 외부 요청에서 지연됐는지 확인하려면 해당 서버의 Sentry 계측과 연결된 Trace span이 수집되어 있어야 합니다. 소스맵이 누락된 배포는 해당 debug ID와 일치하는 파일을 업로드해야 원본 코드 위치를 복원할 수 있습니다. 새 배포의 소스맵으로 과거 배포의 프레임이 복원된다고 가정하지 않습니다.
 
 ## 예약 실행
 
@@ -180,11 +204,12 @@ git push -u origin main
 
 ## 노이즈 및 개인정보 처리
 
-- `levels`에 포함되지 않은 낮은 레벨 제거
+- 조회 구간에 `levels`에 해당하는 이벤트가 하나 이상 있는 이슈 선택(그룹 내 다른 레벨의 이벤트도 분포에 포함)
 - `ignoreContains`에 일치하는 오류 제거
 - `ignoredIssueIds`에 등록한 이슈 제거
 - 이메일, Bearer/JWT, password/token/api key 형태 마스킹
-- 예외 메시지, 애플리케이션 스택 프레임과 허용된 태그만 길이를 제한해 분석
+- 예외·스택·허용된 태그와 응답 오류 필드만 길이를 제한해 분석
+- 요청 body·headers·cookies·user와 응답 전체는 제외하고 URL 쿼리·fragment·URL 인증정보를 제거
 - 로컬 Codex는 비밀 환경변수를 전달하지 않고 Sentry 스택과 연결된 커밋 소스 구간만 조사
 - AI 분석 실패 시 규칙 기반 리포트로 전환
 
@@ -194,4 +219,4 @@ git push -u origin main
 npm run test:unit
 ```
 
-외부 서비스 없이 예약 구간, 다중 프로젝트 요청, 노이즈 필터, Discord 메시지 길이와 민감정보 마스킹을 검증합니다.
+외부 서비스 없이 예약 구간, 다중 프로젝트 요청, 노이즈 필터, Discord 메시지 길이와 민감정보 마스킹을 검증합니다. 혼합된 404/500·희귀 HEAD의 대표 선정, 기간 밖 이벤트 제외, 페이지 중복·실패, Trace 권한 부족과 소스맵 진단 근거 보존도 검증합니다.

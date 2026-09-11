@@ -34,8 +34,8 @@
   "sourceRoots": {
     "weing-dev/orta-client": "../orta",
     "weing-dev/orta-cms": "../orta-cms",
-    "weing-dev/dore-client": "../dore",
-    "weing-dev/dore-cms": "../dore-cms",
+    "weing-dev/dore-client": "../weing-admin-mono/apps/dore-client",
+    "weing-dev/dore-cms": "../weing-admin-mono/apps/dore-admin",
     "weing-dev/naya-client": "../naya",
     "weing-dev/naya-admin": "../naya-admin"
   },
