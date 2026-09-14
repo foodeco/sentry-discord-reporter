@@ -124,8 +124,9 @@ export function computeWindow({ slot, lookbackHours, now = new Date() } = {}) {
   const kstNow = new Date(now.getTime() + KST_OFFSET_MS);
   const year = kstNow.getUTCFullYear();
   const month = kstNow.getUTCMonth();
-  const day = kstNow.getUTCDate();
+  let day = kstNow.getUTCDate();
   const hour = Number(slot);
+  if (kstInstant(year, month, day, hour) > now) day -= 1;
   const end = kstInstant(year, month, day, hour);
   const start = hour === 9
     ? kstInstant(year, month, day - 1, 20)
@@ -133,6 +134,27 @@ export function computeWindow({ slot, lookbackHours, now = new Date() } = {}) {
 
   // ponytail: DB 없이 고정 예약 구간을 사용한다. 실행 누락 자동 복구가 필요해질 때 체크포인트 저장소를 추가한다.
   return { start, end, kind: `${slot}:00 예약 구간` };
+}
+
+export async function resolveReportWindow(env, now = new Date()) {
+  let timestamp = env.REPORT_END;
+  if (!timestamp && env.GITHUB_ACTIONS === "true") {
+    assert(env.GITHUB_REPOSITORY && env.GITHUB_RUN_ID && env.GITHUB_TOKEN, "GitHub 실행 조회에 저장소, 실행 ID, GITHUB_TOKEN이 필요합니다.");
+    const run = await fetchJson(
+      `${env.GITHUB_API_URL || "https://api.github.com"}/repos/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`,
+      { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${env.GITHUB_TOKEN}` } },
+      "GitHub 실행 생성 시각 조회",
+    );
+    timestamp = run.created_at;
+    assert(timestamp, "GitHub 실행의 created_at이 없습니다.");
+  }
+  if (timestamp) {
+    const anchor = new Date(timestamp);
+    assert(typeof timestamp === "string" && /(Z|[+-]\d{2}:\d{2})$/i.test(timestamp) && Number.isFinite(anchor.getTime()), "보고 기준 시각은 시간대가 포함된 ISO 8601 형식이어야 합니다.");
+    assert(anchor <= now, "보고 기준 시각은 현재보다 미래일 수 없습니다.");
+    now = anchor;
+  }
+  return computeWindow({ slot: env.REPORT_SLOT, lookbackHours: env.LOOKBACK_HOURS, now });
 }
 
 export function buildIssuesUrl(organization, window, limit, levels) {
@@ -1206,7 +1228,7 @@ async function sendDiscord(messages, webhookUrl) {
 
 export async function main(env = process.env) {
   const config = await loadConfig(env);
-  const window = computeWindow({ slot: env.REPORT_SLOT, lookbackHours: env.LOOKBACK_HOURS });
+  const window = await resolveReportWindow(env);
   const tokenConfig = parseTokens(env, config.organizations.length);
   const groups = await Promise.all(config.organizations.map((organization) =>
     // 레벨은 그룹 대표값이 아닌 구간 이벤트에 적용한다. count는 그룹 전체, filtered.count는 일치 이벤트 수다.

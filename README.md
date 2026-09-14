@@ -164,12 +164,18 @@ API는 Sentry에 이미 저장된 데이터를 조회합니다. 백엔드의 어
 
 ### GitHub Actions
 
-`.github/workflows/sentry-report.yml`은 다음 시각에 실행됩니다.
+`.github/workflows/sentry-report.yml`은 `Asia/Seoul` 시간대로 다음 시각에 예약됩니다.
 
 - 09:00 KST
 - 20:00 KST
 
 09시 보고는 전날 20시부터 당일 09시까지, 20시 보고는 당일 09시부터 20시까지 조회합니다.
+
+GitHub 예약 이벤트 생성과 러너 배정은 지연될 수 있어 정각 수신을 보장하지 않습니다. [GitHub 예약 실행 안내](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+
+각 실행은 다른 보고의 완료를 기다리지 않고 러너를 요청합니다. 조회 기준은 GitHub 실행의 `created_at`에 고정하므로, 러너가 다음 날 시작하거나 같은 실행을 재시도해도 구간이 바뀌지 않습니다. 예약 구간은 생성 시각 이전의 가장 가까운 해당 슬롯을 선택합니다. 생성 시각을 조회하지 못하면 잘못된 구간으로 전송하지 않고 실패합니다. `GITHUB_TOKEN`은 Actions가 자동 제공하며 `actions: read` 권한으로 실행 정보만 읽습니다.
+
+예약 이벤트 자체가 하루 이상 늦게 생성되거나 누락된 경우에는 원래 날짜를 자동 복구하지 않습니다. 아래 수동 구간 지정으로 복구합니다.
 
 원격 저장소의 **Settings → Secrets and variables → Actions**에 다음 Repository Secret을 등록합니다.
 
@@ -181,6 +187,14 @@ API는 Sentry에 이미 저장된 데이터를 조회합니다. 백엔드의 어
 | `OPENAI_API_KEY` | 아니요 | OpenAI API 분석 |
 
 Actions 화면의 **Run workflow**로 예약 시간 외 수동 실행도 가능합니다.
+
+- `lookback_hours`: 조회할 시간 수(1~168, 기본 24).
+- `report_end`: 선택 사항. 시간대를 포함한 과거 종료 시각. 생략하면 GitHub 실행 생성 시각을 사용합니다.
+- `dry_run`: 선택하면 Discord 전송 없이 보고서를 생성하고 artifact로 보관합니다. Sentry 조회와 설정된 AI 분석은 수행합니다.
+
+예를 들어 9/13 오전 보고를 복구하려면 `report_end=2026-09-13T09:00:00+09:00`, `lookback_hours=13`을 지정합니다. 저녁 보고는 `report_end=2026-09-13T20:00:00+09:00`, `lookback_hours=11`입니다. 로컬에서도 `REPORT_END`와 `LOOKBACK_HOURS` 환경변수로 같은 구간을 지정할 수 있습니다.
+
+기존에 대기 중인 실행은 수정 전 workflow를 사용합니다. 연쇄 대기 복구 시에는 뒤쪽 pending 실행부터 취소하고 앞쪽 queued 실행도 취소한 뒤, 수정본으로 새 수동 실행을 만듭니다. `dry_run`으로 러너 배정과 조회 구간을 확인한 다음 같은 구간으로 전송합니다. 새 실행도 러너를 받지 못하면 GitHub의 러너 배정 문제는 여전히 남아 있는 것입니다.
 
 GitHub-hosted Actions에는 로컬의 ChatGPT 로그인과 형제 소스 저장소가 없으므로, 기본 설정에서는 OpenAI API 또는 규칙 기반 분석을 사용합니다. 생성 문서를 Actions에서 보관하려면 워크플로의 artifact 업로드 단계를 사용합니다.
 

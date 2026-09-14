@@ -7,6 +7,15 @@ on:
         description: "수동 실행 시 조회할 최근 시간"
         required: false
         default: "24"
+      report_end:
+        description: "조회 종료 시각 (생략 시 실행 생성 시각, 예: 2026-09-13T09:00:00+09:00)"
+        required: false
+        type: string
+      dry_run:
+        description: "Discord 전송 없이 보고서 생성"
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 9 * * *"
       timezone: "Asia/Seoul"
@@ -15,10 +24,7 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: sentry-discord-report
-  cancel-in-progress: false
+  actions: read
 
 jobs:
   report:
@@ -33,6 +39,7 @@ jobs:
         run: npm run test:unit
       - name: Fetch, analyze, and notify
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_TOKENS_JSON: ${{ secrets.SENTRY_TOKENS_JSON }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -41,6 +48,8 @@ jobs:
           OPENAI_MODEL: gpt-5.6-luna
           MAX_ISSUES_PER_RUN: "30"
           LOOKBACK_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_hours || '' }}
+          REPORT_END: ${{ github.event_name == 'workflow_dispatch' && inputs.report_end || '' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
           REPORT_SLOT: ${{ github.event.schedule == '0 9 * * *' && '09' || github.event.schedule == '0 20 * * *' && '20' || '' }}
         run: node report.mjs
       - name: Keep project reports

@@ -11,6 +11,7 @@ import {
   renderProjectIndex,
   renderProjectMarkdown,
   renderReport,
+  resolveReportWindow,
   ruleResult,
   selectIssues,
   stackFrames,
@@ -26,6 +27,71 @@ test("20시 예약은 당일 09시부터 20시까지 조회한다", () => {
   const window = computeWindow({ slot: "20", now: new Date("2026-08-22T11:05:00.000Z") });
   assert.equal(window.start.toISOString(), "2026-08-22T00:00:00.000Z");
   assert.equal(window.end.toISOString(), "2026-08-22T11:00:00.000Z");
+});
+
+test("자정 이후 생성된 20시 예약은 직전 20시 구간을 조회한다", () => {
+  for (const [createdAt, start, end] of [
+    ["2026-09-13T15:01:00Z", "2026-09-13T00:00:00.000Z", "2026-09-13T11:00:00.000Z"],
+    ["2026-12-31T15:01:00Z", "2026-12-31T00:00:00.000Z", "2026-12-31T11:00:00.000Z"],
+  ]) {
+    const window = computeWindow({ slot: "20", now: new Date(createdAt) });
+    assert.equal(window.start.toISOString(), start);
+    assert.equal(window.end.toISOString(), end);
+  }
+});
+
+test("러너가 다음 날 시작해도 GitHub 실행 생성 시각의 보고 구간을 유지한다", async (t) => {
+  const env = {
+    GITHUB_ACTIONS: "true",
+    GITHUB_REPOSITORY: "foodeco/sentry-discord-reporter",
+    GITHUB_TOKEN: "unused-test-token",
+  };
+  const fetch = t.mock.method(globalThis, "fetch");
+  for (const [id, slot, createdAt, start, end] of [
+    ["34737229069", "09", "2026-09-13T04:09:30Z", "2026-09-12T11:00:00.000Z", "2026-09-13T00:00:00.000Z"],
+    ["34763756423", "20", "2026-09-13T14:48:59Z", "2026-09-13T00:00:00.000Z", "2026-09-13T11:00:00.000Z"],
+  ]) {
+    fetch.mock.mockImplementation(async (url, options) => {
+      assert.equal(url, `https://api.github.com/repos/foodeco/sentry-discord-reporter/actions/runs/${id}`);
+      assert.equal(options.headers.Authorization, "Bearer unused-test-token");
+      return Response.json({ created_at: createdAt });
+    });
+    for (const startedAt of ["2026-09-14T01:30:00Z", "2026-09-15T01:30:00Z"]) {
+      const window = await resolveReportWindow({ ...env, GITHUB_RUN_ID: id, REPORT_SLOT: slot }, new Date(startedAt));
+      assert.equal(window.start.toISOString(), start);
+      assert.equal(window.end.toISOString(), end);
+    }
+    const manual = await resolveReportWindow({ ...env, GITHUB_RUN_ID: id, LOOKBACK_HOURS: "24" }, new Date("2026-09-14T01:30:00Z"));
+    assert.equal(manual.end.toISOString(), new Date(createdAt).toISOString());
+    assert.equal(manual.end - manual.start, 24 * 60 * 60 * 1000);
+  }
+});
+
+test("누락 구간의 종료 시각과 조회 시간을 지정하고 잘못된 시각은 거부한다", async (t) => {
+  t.mock.method(globalThis, "fetch", () => { throw new Error("명시한 구간은 GitHub 조회가 필요 없다"); });
+  const now = new Date("2026-09-14T01:30:00Z");
+  for (const [end, hours, start] of [
+    ["2026-09-13T09:00:00+09:00", "13", "2026-09-12T11:00:00.000Z"],
+    ["2026-09-13T20:00:00+09:00", "11", "2026-09-13T00:00:00.000Z"],
+  ]) {
+    const window = await resolveReportWindow({ GITHUB_ACTIONS: "true", REPORT_END: end, LOOKBACK_HOURS: hours }, now);
+    assert.equal(window.start.toISOString(), start);
+    assert.equal(window.end.toISOString(), new Date(end).toISOString());
+  }
+  for (const end of ["invalid", "2026-09-13T09:00:00", "2026-09-15T09:00:00+09:00"]) {
+    await assert.rejects(resolveReportWindow({ REPORT_END: end }, now), /보고 기준 시각/);
+  }
+  const local = await resolveReportWindow({}, now);
+  assert.equal(local.start.toISOString(), "2026-09-13T01:30:00.000Z");
+  assert.equal(local.end.toISOString(), now.toISOString());
+});
+
+test("GitHub 기준 시각을 조회하지 못하면 실행 시각으로 대체하지 않고 중단한다", async (t) => {
+  const env = { GITHUB_ACTIONS: "true", GITHUB_REPOSITORY: "owner/repo", GITHUB_RUN_ID: "1", GITHUB_TOKEN: "unused-test-token", REPORT_SLOT: "20" };
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ message: "Forbidden" }, { status: 403 }));
+  await assert.rejects(resolveReportWindow(env), /GitHub 실행 생성 시각 조회 실패 \(403\)/);
+  fetch.mock.mockImplementation(async () => Response.json({}));
+  await assert.rejects(resolveReportWindow(env), /created_at/);
 });
 
 test("한 조직의 여러 프로젝트와 환경을 한 Sentry 요청에 넣는다", () => {
