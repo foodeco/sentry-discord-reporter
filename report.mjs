@@ -23,6 +23,7 @@ const ANALYSIS_INSTRUCTIONS = [
   "analysis에는 예외 메시지와 애플리케이션 스택을 근거로 추정 원인을 쓰고, 근거가 부족하면 확인 불가라고 명시하세요.",
   "nextAction에는 즉시 확인할 위치, 수정 방향, 수정 후 검증 방법을 구체적으로 쓰세요.",
   "degraded_mode=true는 호출자가 명시적 폴백으로 처리한 오류입니다. 별도의 렌더 실패 근거가 없으면 P1으로 분류하지 마세요.",
+  "예약 API 실패는 원본 warning이어도 최소 P1이며 noise=false입니다. 양쪽 예약 결과는 응답 근거가 있을 때만 판단하고, 한쪽 로그가 없으면 성공으로 추정하지 마세요.",
   "일시적 네트워크/브라우저 확장/봇/이미 알려진 무해 오류라는 근거가 충분할 때만 noise=true로 분류하세요.",
   "P0는 전체 장애·데이터 손실·보안 사고, P1은 신규/재발 고영향 오류, P2는 일반 운영 오류, P3는 낮은 영향으로 분류하세요.",
 ];
@@ -273,12 +274,14 @@ export function selectIssues(issues, config, window) {
   return [...deduplicated.values()]
     .filter((issue) => {
       if (["resolved", "ignored"].includes(String(issue.status).toLowerCase())) return false;
-      if (!config.levels.size || (!issue.__levelFiltered && !config.levels.has(String(issue.level || "error").toLowerCase()))) return false;
+      if (!isReservationApiIssue(issue) && (!config.levels.size || (!issue.__levelFiltered && !config.levels.has(String(issue.level || "error").toLowerCase())))) return false;
       if (config.ignoredIssueIds.has(String(issue.id)) || config.ignoredIssueIds.has(String(issue.shortId))) return false;
       if (config.ignoreContains.some((pattern) => issueText(issue).includes(pattern))) return false;
       return Date.parse(issue.lastSeen) >= window.start.getTime();
     })
-    .sort((left, right) => issueScore(right, window) - issueScore(left, window) || Date.parse(right.lastSeen) - Date.parse(left.lastSeen))
+    .sort((left, right) => Number(rulePriority(right, window) === "P0") - Number(rulePriority(left, window) === "P0")
+      || Number(isReservationApiIssue(right)) - Number(isReservationApiIssue(left))
+      || issueScore(right, window) - issueScore(left, window) || Date.parse(right.lastSeen) - Date.parse(left.lastSeen))
     .slice(0, config.maxIssues);
 }
 
@@ -538,6 +541,7 @@ export async function fetchIssueEvidence(issue, token, window, traceCache = new 
       }
       samples.push({ id, url: eventUrl.href, traceUrl: traceUrl?.href,
         replayUrl: /^[a-f\d-]{32,36}$/i.test(replayId || "") ? new URL(`/organizations/${organization}/replays/${replayId}/`, base).href : undefined,
+        reservationApi: /\/(?:reservations?(?:\/|$)|reservation-api\/)/i.test(safeUrl(event.contexts?.api?.endpoint)),
         context: extractEventContext(event),
         diagnostics: samples.length === 0 ? await eventDiagnostics(event, issue, token, window, traceCache) : "",
       });
@@ -613,10 +617,15 @@ function usesFallback(issue) {
   return /\bdegraded_mode=true\b/i.test(String(issue.eventContext || ""));
 }
 
+function isReservationApiIssue(issue) {
+  return issue.eventEvidence?.samples.some((sample) => sample.reservationApi) || false;
+}
+
 function rulePriority(issue, window) {
   const level = issue.eventEvidence?.variants.some(([variant]) => variant.startsWith("fatal · ")) ? "fatal"
     : issue.eventEvidence?.variants.some(([variant]) => variant.startsWith("error · ")) ? "error" : String(issue.level).toLowerCase();
   if (level === "fatal") return "P0";
+  if (isReservationApiIssue(issue)) return "P1";
   if (usesFallback(issue)) return "P2";
   if (String(issue.priority).toLowerCase() === "high" || isRegression(issue) || Date.parse(issue.lifetime?.firstSeen || issue.firstSeen) >= window.start.getTime()) return "P1";
   if (level === "error") return "P2";
@@ -625,7 +634,7 @@ function rulePriority(issue, window) {
 
 export function ruleResult(issue, window) {
   const isNew = Date.parse(issue.lifetime?.firstSeen || issue.firstSeen) >= window.start.getTime();
-  const reason = [isNew ? "신규" : null, isRegression(issue) ? "재발" : null, usesFallback(issue) ? "폴백 처리" : null, issue.level, `구간 ${issue.count || 0}건`]
+  const reason = [isReservationApiIssue(issue) ? "예약 API 실패 · 최소 P1 필수 보고" : null, isNew ? "신규" : null, isRegression(issue) ? "재발" : null, usesFallback(issue) ? "폴백 처리" : null, issue.level, `구간 ${issue.count || 0}건`]
     .filter(Boolean)
     .join(" · ");
   const observed = issue.eventEvidence?.samples.map((sample) => sample.context.split("\n").find((line) => line.startsWith("API response:")) || sample.context.split("\n").find((line) => line.startsWith("Exception:"))).filter(Boolean);
@@ -916,9 +925,14 @@ async function analyzeIssues(issues, window, env = process.env, sourceRoot) {
       const analyzed = await analyze();
       const byKey = new Map(analyzed.issues.map((item) => [item.issueKey, item]));
       analyzed.summary = String(analyzed.summary).replace(/\bsourceContext\b/g, "커밋 소스");
-      analyzed.issues = fallbackIssues.map((fallback) => {
+      analyzed.issues = fallbackIssues.map((fallback, index) => {
         const item = byKey.get(fallback.issueKey);
         if (!item) return fallback;
+        if (isReservationApiIssue(issues[index])) {
+          item.priority = item.priority === "P0" || fallback.priority === "P0" ? "P0" : "P1";
+          item.noise = false;
+          item.reason = `예약 API 실패 · 최소 P1 필수 보고 · ${item.reason}`;
+        }
         return Object.fromEntries(Object.entries(item).map(([key, value]) => [key, typeof value === "string" ? value.replace(/\bsourceContext\b/g, "커밋 소스") : value]));
       });
       return analyzed;
@@ -1230,12 +1244,25 @@ export async function main(env = process.env) {
   const config = await loadConfig(env);
   const window = await resolveReportWindow(env);
   const tokenConfig = parseTokens(env, config.organizations.length);
-  const groups = await Promise.all(config.organizations.map((organization) =>
+  const groups = await Promise.all(config.organizations.map(async (organization) => {
+    const token = tokenFor(organization, tokenConfig);
     // 레벨은 그룹 대표값이 아닌 구간 이벤트에 적용한다. count는 그룹 전체, filtered.count는 일치 이벤트 수다.
-    fetchOrganizationIssues(organization, tokenFor(organization, tokenConfig), window, SENTRY_FETCH_LIMIT, config.levels),
-  ));
-  const issues = selectIssues(groups.flat(), config, window);
-  const enriched = await enrichIssues(issues, tokenConfig, window);
+    const [regular, warnings] = await Promise.all([
+      fetchOrganizationIssues(organization, token, window, SENTRY_FETCH_LIMIT, config.levels),
+      config.levels.has("warning") ? [] : fetchOrganizationIssues(
+        { ...organization, query: [organization.query, "has:api_source"].filter(Boolean).join(" ") },
+        token, window, SENTRY_FETCH_LIMIT, new Set(["warning"]),
+      ),
+    ]);
+    return { regular, warnings };
+  }));
+  const regular = selectIssues(groups.flatMap((group) => group.regular), config, window);
+  // 예약과 무관한 warning이 보고 한도를 소모하지 않도록 원문의 API endpoint를 확인한 뒤 최종 선택한다.
+  // ponytail: API warning 후보는 조직 설정당 100그룹까지 확인한다. 초과 시 후보 조회에 페이지 처리를 추가한다.
+  const warnings = selectIssues(groups.flatMap((group) => group.warnings), { ...config, maxIssues: Infinity }, window)
+    .map((issue) => ({ ...issue, __levelFiltered: false }));
+  const candidates = [...new Map([...warnings, ...regular].map((issue) => [issueKey(issue), issue])).values()];
+  const enriched = selectIssues(await enrichIssues(candidates, tokenConfig, window), config, window);
   const projectResults = await analyzeProjects(config, enriched, window, env);
   const analysis = combineProjectAnalyses(projectResults);
   const report = await writeProjectReports(projectResults, window, env);

@@ -144,6 +144,12 @@ Remove-Item Env:DRY_RUN
 
 보고 대상의 레벨 조건은 Sentry 검색 `level:[error,fatal]`처럼 구간 이벤트에 적용합니다. 그룹의 대표 레벨이 나중에 warning으로 바뀌어도 구간 안의 error가 누락되지 않습니다. 신규 여부는 전체 이력의 `lifetime.firstSeen`을 우선 사용하고 구간 첫 발생과 구분합니다. 조직 설정당 이슈 최대 100건을 조회하고 `MAX_ISSUES_PER_RUN`(기본 30)만큼 우선순위에 따라 보고하므로, 전체 점검에는 이 값을 100까지 늘릴 수 있습니다.
 
+예약 API 실패는 원본이 `warning`이어도 별도로 수집해 **최소 P1로 보고**합니다. `api_source` 태그가 있는 warning을 조직 설정당 최대 100그룹 조회하고, 대표 이벤트의 실제 API endpoint에 `/reservation`, `/reservations`, `/reservation-api/` 경로가 있는지 확인합니다. 예약 생성·조회·연결 API가 대상이며, 예약 페이지에서 발생한 단순 입력 누락 경고는 이 예외에 포함하지 않습니다. 예약 API 오류는 AI가 노이즈나 낮은 우선순위로 분류해도 보고에 유지합니다. 명시한 무시 규칙·해결 상태 필터·최종 보고 건수 한도는 유지하며 Sentry 원본 레벨은 변경하지 않습니다.
+
+보고 건수 한도에서는 P0, 예약 API 실패, 나머지 이슈 순으로 선택합니다.
+
+스마트닥터와 위잉의 예약 결과는 확보된 응답 근거로 판단합니다. 한쪽 실패만 기록되어 있거나 통신 상세가 삭제된 경우, 반대편을 성공으로 간주하지 않습니다.
+
 | API | 리포트에 포함되는 근거 | 읽기 권한 |
 |---|---|---|
 | [Issue Events](https://docs.sentry.io/api/events/list-an-issues-events/) | 구간별 레벨·메시지, 메서드, 경로, 릴리스, 브라우저, 집중 시각 | `event:read` |
@@ -219,6 +225,7 @@ git push -u origin main
 ## 노이즈 및 개인정보 처리
 
 - 조회 구간에 `levels`에 해당하는 이벤트가 하나 이상 있는 이슈 선택(그룹 내 다른 레벨의 이벤트도 분포에 포함)
+- `api_source`가 있는 예약 API warning은 endpoint 확인 후 최소 P1로 포함
 - `ignoreContains`에 일치하는 오류 제거
 - `ignoredIssueIds`에 등록한 이슈 제거
 - 이메일, Bearer/JWT, password/token/api key 형태 마스킹
@@ -234,3 +241,4 @@ npm run test:unit
 ```
 
 외부 서비스 없이 예약 구간, 다중 프로젝트 요청, 노이즈 필터, Discord 메시지 길이와 민감정보 마스킹을 검증합니다. 혼합된 404/500·희귀 HEAD의 대표 선정, 기간 밖 이벤트 제외, 페이지 중복·실패, Trace 권한 부족과 소스맵 진단 근거 보존도 검증합니다.
+예약 API warning이 일반 warning에 묻히거나 AI 노이즈 분류로 사라지지 않는 회귀도 검증합니다.

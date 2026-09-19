@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   buildIssuesUrl,
@@ -7,6 +10,7 @@ import {
   computeWindow,
   extractEventContext,
   fetchIssueEvidence,
+  main,
   normalizeConfig,
   renderProjectIndex,
   renderProjectMarkdown,
@@ -16,6 +20,68 @@ import {
   selectIssues,
   stackFrames,
 } from "./report.mjs";
+
+test("예약 API warning을 별도 수집해 보고 한도와 AI 노이즈 분류에도 최소 P1로 보고한다", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "sentry-reservation-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configPath = join(directory, "targets.json");
+  await writeFile(configPath, JSON.stringify({ organizations: [{ slug: "weing", projects: ["web"] }] }));
+  const base = { project: { slug: "web" }, status: "unresolved", count: "1", level: "warning", firstSeen: "2026-09-01T00:00:00Z", lastSeen: "2026-09-10T23:00:00Z" };
+  const warnings = [
+    ...Array.from({ length: 6 }, (_, index) => ({ ...base, id: `noise${index}`, shortId: `NOISE-${index}`, title: "unrelated warning", priority: "high" })),
+    { ...base, id: "weing", shortId: "BOOKING-WEING", title: "reservation 400" },
+    { ...base, id: "smartdoctor", shortId: "BOOKING-SD", title: "reservation 409" },
+  ];
+  const regular = [
+    { ...base, id: "fatal", shortId: "FATAL-1", level: "fatal", title: "unrelated fatal" },
+    ...Array.from({ length: 2 }, (_, index) => ({ ...base, id: `regular${index}`, shortId: `ERROR-${index}`, level: "error", priority: "high", count: "1", userCount: 100 })),
+  ];
+  let analyzedIds;
+  let warningQuery;
+  t.mock.method(console, "log", () => {});
+  t.mock.method(globalThis, "fetch", async (input, options) => {
+    const url = new URL(input);
+    if (url.hostname === "api.openai.com") {
+      const payload = JSON.parse(JSON.parse(options.body).input);
+      analyzedIds = payload.issues.map((issue) => issue.shortId);
+      return Response.json({ output_text: JSON.stringify({ summary: "AI classified everything as noise", sourceEvidenceUsed: false, issues: payload.issues.map((issue) => ({ issueKey: issue.issueKey, priority: "P3", noise: true, reason: "handled", analysis: "observed failure", nextAction: "inspect response" })) }) });
+    }
+    if (url.pathname.endsWith("/issues/")) {
+      if (url.searchParams.get("query").includes("level:[warning]")) {
+        warningQuery = url.searchParams.get("query");
+        return Response.json(warnings);
+      }
+      return Response.json(regular);
+    }
+    const id = url.pathname.match(/\/issues\/([^/]+)\//)?.[1];
+    const issue = [...warnings, ...regular].find((item) => item.id === id);
+    assert.ok(issue, `unexpected request: ${url.pathname}`);
+    const event = { eventID: id, title: issue.title, dateCreated: issue.lastSeen, tags: [{ key: "level", value: issue.level }] };
+    if (url.pathname.endsWith("/events/")) return Response.json([event]);
+    const endpoint = id === "weing" ? "/api/schedules/reservations?token=secret"
+      : id === "smartdoctor" ? "/reservation-api/v2/customers/[id]/reservations"
+        : "/api/banners";
+    return Response.json({ ...event, contexts: { api: { endpoint, method: "POST", status: 400 } } });
+  });
+  await main({ TARGETS_FILE: configPath, REPORTS_DIR: directory, REPORT_END: "2026-09-11T00:00:00Z", LOOKBACK_HOURS: "13", MAX_ISSUES_PER_RUN: "3", SENTRY_AUTH_TOKEN: "unused-test-token", OPENAI_API_KEY: "unused-test-key", CODEX_CLI_ANALYSIS: "0", DRY_RUN: "1" });
+  assert.equal(warningQuery, "is:unresolved has:api_source level:[warning]");
+  assert.deepEqual(new Set(analyzedIds), new Set(["FATAL-1", "BOOKING-WEING", "BOOKING-SD"]));
+  const report = await readFile(join(directory, "2026-09-11", "0900", "weing__web.md"), "utf8");
+  assert.match(report, /P1 2/);
+  assert.match(report, /예약 API 실패 · 최소 P1 필수 보고/);
+  assert.doesNotMatch(report, /NOISE-/);
+  for (const endpoint of ["/api/schedules/reservations/plan-mappings", "/api/reservations/123"]) {
+    // 같은 원문 조회 경계를 사용해 연결·조회 API도 예약 오류로 유지한다.
+    const fetchMock = t.mock.method(globalThis, "fetch", async (input) => new URL(input).pathname.endsWith("/events/")
+      ? Response.json([{ eventID: "mapping", title: "409", dateCreated: base.lastSeen, tags: [{ key: "level", value: "warning" }] }])
+      : Response.json({ contexts: { api: { endpoint, status: 409 } } }));
+    const issue = { ...base, id: "mapping", __organization: { slug: "weing", baseUrl: "https://sentry.io", environments: [] } };
+    const window = { start: new Date("2026-09-10T11:00:00Z"), end: new Date("2026-09-11T00:00:00Z") };
+    issue.eventEvidence = await fetchIssueEvidence(issue, "unused-test-token", window);
+    assert.equal(ruleResult(issue, window).priority, "P1");
+    fetchMock.mock.restore();
+  }
+});
 
 test("09시 예약은 전날 20시부터 당일 09시까지 조회한다", () => {
   const window = computeWindow({ slot: "09", now: new Date("2026-08-22T00:05:00.000Z") });
