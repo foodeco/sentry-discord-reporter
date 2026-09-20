@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   buildIssuesUrl,
@@ -68,7 +68,7 @@ test("예약 API warning을 별도 수집해 보고 한도와 AI 노이즈 분�
   assert.deepEqual(new Set(analyzedIds), new Set(["FATAL-1", "BOOKING-WEING", "BOOKING-SD"]));
   const report = await readFile(join(directory, "2026-09-11", "0900", "weing__web.md"), "utf8");
   assert.match(report, /P1 2/);
-  assert.match(report, /예약 API 실패 · 최소 P1 필수 보고/);
+  assert.match(report, /예약 실패 · 최소 P1 필수 보고/);
   assert.doesNotMatch(report, /NOISE-/);
   for (const endpoint of ["/api/schedules/reservations/plan-mappings", "/api/reservations/123"]) {
     // 같은 원문 조회 경계를 사용해 연결·조회 API도 예약 오류로 유지한다.
@@ -81,6 +81,84 @@ test("예약 API warning을 별도 수집해 보고 한도와 AI 노이즈 분�
     assert.equal(ruleResult(issue, window).priority, "P1");
     fetchMock.mock.restore();
   }
+});
+
+test("예약 워크플로의 방향과 사유를 개인정보 없이 보고하고 오래된 이슈도 한도·AI 강등에서 보호한다", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "sentry-workflow-test-"));
+  t.after(async () => {
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = join(directory, "targets.json");
+  await writeFile(configPath, JSON.stringify({ organizations: [{ slug: "weing", projects: ["web"] }] }));
+  const base = { project: { slug: "web" }, status: "unresolved", count: "1", level: "error", firstSeen: "2026-09-01T00:00:00Z", lastSeen: "2026-09-10T23:00:00Z" };
+  const workflows = [
+    { id: "sd-only", outcome: "smart-doctor-only", failures: { "weing-reservation": 400 }, failureReasons: { "weing-reservation": "api-error" } },
+    { id: "weing-only", outcome: "weing-only", failures: { "smart-doctor-reservation": null }, failureReasons: { "smart-doctor-reservation": "unexpected-exception" } },
+    { id: "none", outcome: "none", failures: { "smart-doctor-reservation": null, "weing-reservation": 503 }, failureReasons: { "smart-doctor-reservation": "invalid-response", "weing-reservation": "api-error" } },
+  ];
+  const issues = [
+    { ...base, id: "fatal", shortId: "FATAL", level: "fatal", title: "unrelated fatal" },
+    ...Array.from({ length: 5 }, (_, index) => ({ ...base, id: `regular${index}`, shortId: `REGULAR-${index}`, title: "unrelated error", priority: "high", userCount: 100 })),
+    ...workflows.map(({ id }) => ({ ...base, id, shortId: `WORKFLOW-${id}`, title: "Reservation workflow failed" })),
+  ];
+  const recovery = {
+    name: "Private recovery person", email: "recovery@example.invalid", phoneNumber: "010-0000-0000",
+    smartDoctorCustomerNumber: "64959", smartDoctorReservationId: '{"customerNumber":"64959","seqNo":1}',
+    reservationId: "private-reservation-id", memo: "Private recovery memo",
+  };
+  let analysisInput;
+  const log = t.mock.method(console, "log", () => {});
+  t.mock.method(globalThis, "fetch", async (input, options) => {
+    const url = new URL(input);
+    if (url.hostname === "api.openai.com") {
+      analysisInput = JSON.parse(JSON.parse(options.body).input);
+      return Response.json({ output_text: JSON.stringify({ summary: "AI noise", sourceEvidenceUsed: false, issues: analysisInput.issues.map((issue) => ({ issueKey: issue.issueKey, priority: "P3", noise: true, reason: "handled", analysis: "inspect", nextAction: "inspect" })) }) });
+    }
+    assert.equal(url.hostname, "sentry.io");
+    if (url.pathname.endsWith("/issues/")) return Response.json(url.searchParams.get("query").includes("level:[warning]") ? [] : issues);
+    const id = url.pathname.match(/\/issues\/([^/]+)\//)?.[1];
+    const issue = issues.find((item) => item.id === id);
+    assert.ok(issue, `unexpected request: ${url.pathname}`);
+    const workflow = workflows.find((item) => item.id === id);
+    const event = { eventID: id, title: issue.title, dateCreated: issue.lastSeen, tags: [{ key: "level", value: issue.level }] };
+    if (url.pathname.endsWith("/events/")) return Response.json([event]);
+    if (!workflow) return Response.json(event);
+    return Response.json({
+      ...event,
+      tags: [...event.tags, { key: "operation", value: "cart-reservation.submit" }, { key: "booking_outcome", value: workflow.outcome }, { key: "phase", value: Object.keys(workflow.failures).join(",") }],
+      contexts: { reservation: { ...recovery, ...workflow } },
+    });
+  });
+  await main({ TARGETS_FILE: configPath, REPORTS_DIR: directory, REPORT_END: "2026-09-11T00:00:00Z", LOOKBACK_HOURS: "13", MAX_ISSUES_PER_RUN: "4", SENTRY_AUTH_TOKEN: "unused-test-token", OPENAI_API_KEY: "unused-test-key", CODEX_CLI_ANALYSIS: "0", DRY_RUN: "1" });
+  assert.deepEqual(new Set(analysisInput.issues.map((issue) => issue.shortId)), new Set(["FATAL", ...workflows.map(({ id }) => `WORKFLOW-${id}`)]));
+  const markdown = await readFile(join(directory, "2026-09-11", "0900", "weing__web.md"), "utf8");
+  const discord = log.mock.calls.map((call) => call.arguments.join(" ")).join("\n");
+  for (const output of [markdown, discord, JSON.stringify(analysisInput)]) {
+    assert.match(output, /스마트닥터 확인 · 위잉 미확인/);
+    assert.match(output, /위잉 확인 · 스마트닥터 미확인/);
+    assert.match(output, /양쪽 예약 미확인/);
+    assert.match(output, /응답 확인 기준/);
+    assert.match(output, /weing-reservation=400\/api-error/);
+    assert.match(output, /smart-doctor-reservation=미확인\/unexpected-exception/);
+    assert.match(output, /smart-doctor-reservation=미확인\/invalid-response/);
+    for (const privateValue of Object.values(recovery)) assert.ok(!output.includes(privateValue));
+  }
+  assert.match(markdown, /P1 3/);
+  assert.match(discord, /\[P1\] WORKFLOW-sd-only/);
+  assert.match(discord, /예약 이벤트: https:\/\/sentry\.io\/organizations\/weing\/issues\/sd-only\/events\/sd-only\//);
+
+  const window = { start: new Date("2026-09-10T11:00:00Z"), end: new Date("2026-09-11T00:00:00Z") };
+  const issue = { ...issues.at(-1), __organization: { slug: "weing", baseUrl: "https://sentry.io", environments: [] } };
+  issue.eventEvidence = await fetchIssueEvidence(issue, "unused-test-token", window);
+  assert.equal(ruleResult(issue, window).priority, "P1", "AI를 쓰지 않아도 반복 워크플로 오류는 P1이다");
+
+  const invalidMetadata = extractEventContext({
+    tags: [["operation", "cart-reservation.submit"], ["booking_outcome", recovery.name], ["phase", recovery.phoneNumber]],
+    contexts: { reservation: { ...recovery, failures: { [recovery.email]: 400, "weing-reservation": recovery.phoneNumber }, failureReasons: { "weing-reservation": recovery.memo } } },
+  });
+  assert.match(invalidMetadata, /결과 미확인.*weing-reservation=미확인/);
+  for (const privateValue of Object.values(recovery)) assert.ok(!invalidMetadata.includes(privateValue));
 });
 
 test("09시 예약은 전날 20시부터 당일 09시까지 조회한다", () => {

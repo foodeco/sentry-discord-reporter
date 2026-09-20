@@ -23,7 +23,7 @@ const ANALYSIS_INSTRUCTIONS = [
   "analysis에는 예외 메시지와 애플리케이션 스택을 근거로 추정 원인을 쓰고, 근거가 부족하면 확인 불가라고 명시하세요.",
   "nextAction에는 즉시 확인할 위치, 수정 방향, 수정 후 검증 방법을 구체적으로 쓰세요.",
   "degraded_mode=true는 호출자가 명시적 폴백으로 처리한 오류입니다. 별도의 렌더 실패 근거가 없으면 P1으로 분류하지 마세요.",
-  "예약 API 실패는 원본 warning이어도 최소 P1이며 noise=false입니다. 양쪽 예약 결과는 응답 근거가 있을 때만 판단하고, 한쪽 로그가 없으면 성공으로 추정하지 마세요.",
+  "예약 API 및 예약 워크플로 실패는 최소 P1이며 noise=false입니다. API 실패는 원본 warning이어도 보고합니다. 예약 결과는 응답 확인 기준이며 미확인을 실제 DB 부재로 단정하지 마세요. 한쪽 로그가 없으면 성공으로 추정하지 마세요.",
   "일시적 네트워크/브라우저 확장/봇/이미 알려진 무해 오류라는 근거가 충분할 때만 noise=true로 분류하세요.",
   "P0는 전체 장애·데이터 손실·보안 사고, P1은 신규/재발 고영향 오류, P2는 일반 운영 오류, P3는 낮은 영향으로 분류하세요.",
 ];
@@ -274,13 +274,13 @@ export function selectIssues(issues, config, window) {
   return [...deduplicated.values()]
     .filter((issue) => {
       if (["resolved", "ignored"].includes(String(issue.status).toLowerCase())) return false;
-      if (!isReservationApiIssue(issue) && (!config.levels.size || (!issue.__levelFiltered && !config.levels.has(String(issue.level || "error").toLowerCase())))) return false;
+      if (!isReservationIssue(issue) && (!config.levels.size || (!issue.__levelFiltered && !config.levels.has(String(issue.level || "error").toLowerCase())))) return false;
       if (config.ignoredIssueIds.has(String(issue.id)) || config.ignoredIssueIds.has(String(issue.shortId))) return false;
       if (config.ignoreContains.some((pattern) => issueText(issue).includes(pattern))) return false;
       return Date.parse(issue.lastSeen) >= window.start.getTime();
     })
     .sort((left, right) => Number(rulePriority(right, window) === "P0") - Number(rulePriority(left, window) === "P0")
-      || Number(isReservationApiIssue(right)) - Number(isReservationApiIssue(left))
+      || Number(isReservationIssue(right)) - Number(isReservationIssue(left))
       || issueScore(right, window) - issueScore(left, window) || Date.parse(right.lastSeen) - Date.parse(left.lastSeen))
     .slice(0, config.maxIssues);
 }
@@ -319,6 +319,31 @@ function eventTags(event) {
   return Object.fromEntries((event.tags || []).map((tag) => Array.isArray(tag) ? tag : [tag.key, tag.value]));
 }
 
+function reservationWorkflowSummary(event) {
+  const tags = eventTags(event);
+  if (tags.operation !== "cart-reservation.submit") return "";
+  const reservation = event.contexts?.reservation;
+  const outcomes = {
+    "smart-doctor-only": "스마트닥터 확인 · 위잉 미확인",
+    "weing-only": reservation?.smartDoctorSkipped === true ? "위잉 확인 · 스마트닥터 연동 생략" : "위잉 확인 · 스마트닥터 미확인",
+    both: "양쪽 예약 확인",
+    none: "양쪽 예약 미확인",
+  };
+  const outcome = tags.booking_outcome ?? reservation?.outcome;
+  const result = typeof outcome === "string" && Object.hasOwn(outcomes, outcome) ? `${outcomes[outcome]} (${outcome})` : "결과 미확인";
+  const phases = typeof tags.phase === "string" ? tags.phase.split(",") : [];
+  // 복구용 고객번호·연락처는 Sentry에서 조회한다. 리포터에는 고정 단계·사유와 상태만 전달한다.
+  const failures = ["smart-doctor-customer", "smart-doctor-reservation", "weing-reservation", "plan-mapping", "mapping-identifiers"]
+    .filter((stage) => Object.hasOwn(reservation?.failures ?? {}, stage) || phases.includes(stage))
+    .map((stage) => {
+      const status = reservation?.failures?.[stage];
+      const reason = reservation?.failureReasons?.[stage];
+      const knownReason = ["api-error", "invalid-response", "unexpected-exception", "missing-identifier"].includes(reason);
+      return `${stage}=${Number.isInteger(status) && status >= 100 && status <= 599 ? status : "미확인"}${knownReason ? `/${reason}` : ""}`;
+    });
+  return `예약 결과: ${result} · 응답 확인 기준 · 실패: ${failures.join(", ") || "단계 미확인"}`;
+}
+
 function frameLine(frame) {
   const filename = safeUrl(frame.filename || frame.absPath || frame.module || "unknown");
   const callable = frame.function || "<anonymous>";
@@ -339,6 +364,8 @@ export function extractEventContext(event) {
   ];
   const selectedTags = allowedTags.filter((key) => tags[key] !== undefined).map((key) => `${key}=${safeUrl(tags[key])}`);
   if (selectedTags.length) parts.push(`Tags: ${selectedTags.join(", ")}`);
+  const workflow = reservationWorkflowSummary(event);
+  if (workflow) parts.push(workflow);
   parts.push(`Release: ${event.release?.version || tags.release || "미수집"} · SDK: ${event.sdk?.name || "미수집"} ${event.sdk?.version || ""}`);
 
   const api = event.contexts?.api;
@@ -542,6 +569,7 @@ export async function fetchIssueEvidence(issue, token, window, traceCache = new 
       samples.push({ id, url: eventUrl.href, traceUrl: traceUrl?.href,
         replayUrl: /^[a-f\d-]{32,36}$/i.test(replayId || "") ? new URL(`/organizations/${organization}/replays/${replayId}/`, base).href : undefined,
         reservationApi: /\/(?:reservations?(?:\/|$)|reservation-api\/)/i.test(safeUrl(event.contexts?.api?.endpoint)),
+        reservationWorkflow: reservationWorkflowSummary(event),
         context: extractEventContext(event),
         diagnostics: samples.length === 0 ? await eventDiagnostics(event, issue, token, window, traceCache) : "",
       });
@@ -617,15 +645,15 @@ function usesFallback(issue) {
   return /\bdegraded_mode=true\b/i.test(String(issue.eventContext || ""));
 }
 
-function isReservationApiIssue(issue) {
-  return issue.eventEvidence?.samples.some((sample) => sample.reservationApi) || false;
+function isReservationIssue(issue) {
+  return issue.eventEvidence?.samples.some((sample) => sample.reservationApi || sample.reservationWorkflow) || false;
 }
 
 function rulePriority(issue, window) {
   const level = issue.eventEvidence?.variants.some(([variant]) => variant.startsWith("fatal · ")) ? "fatal"
     : issue.eventEvidence?.variants.some(([variant]) => variant.startsWith("error · ")) ? "error" : String(issue.level).toLowerCase();
   if (level === "fatal") return "P0";
-  if (isReservationApiIssue(issue)) return "P1";
+  if (isReservationIssue(issue)) return "P1";
   if (usesFallback(issue)) return "P2";
   if (String(issue.priority).toLowerCase() === "high" || isRegression(issue) || Date.parse(issue.lifetime?.firstSeen || issue.firstSeen) >= window.start.getTime()) return "P1";
   if (level === "error") return "P2";
@@ -634,10 +662,10 @@ function rulePriority(issue, window) {
 
 export function ruleResult(issue, window) {
   const isNew = Date.parse(issue.lifetime?.firstSeen || issue.firstSeen) >= window.start.getTime();
-  const reason = [isReservationApiIssue(issue) ? "예약 API 실패 · 최소 P1 필수 보고" : null, isNew ? "신규" : null, isRegression(issue) ? "재발" : null, usesFallback(issue) ? "폴백 처리" : null, issue.level, `구간 ${issue.count || 0}건`]
+  const reason = [isReservationIssue(issue) ? "예약 실패 · 최소 P1 필수 보고" : null, isNew ? "신규" : null, isRegression(issue) ? "재발" : null, usesFallback(issue) ? "폴백 처리" : null, issue.level, `구간 ${issue.count || 0}건`]
     .filter(Boolean)
     .join(" · ");
-  const observed = issue.eventEvidence?.samples.map((sample) => sample.context.split("\n").find((line) => line.startsWith("API response:")) || sample.context.split("\n").find((line) => line.startsWith("Exception:"))).filter(Boolean);
+  const observed = issue.eventEvidence?.samples.map((sample) => sample.reservationWorkflow || sample.context.split("\n").find((line) => line.startsWith("API response:")) || sample.context.split("\n").find((line) => line.startsWith("Exception:"))).filter(Boolean);
   const diagnostics = issue.eventEvidence?.samples.map((sample) => sample.diagnostics).join("\n") || "";
   return {
     issueKey: issueKey(issue),
@@ -928,10 +956,10 @@ async function analyzeIssues(issues, window, env = process.env, sourceRoot) {
       analyzed.issues = fallbackIssues.map((fallback, index) => {
         const item = byKey.get(fallback.issueKey);
         if (!item) return fallback;
-        if (isReservationApiIssue(issues[index])) {
+        if (isReservationIssue(issues[index])) {
           item.priority = item.priority === "P0" || fallback.priority === "P0" ? "P0" : "P1";
           item.noise = false;
-          item.reason = `예약 API 실패 · 최소 P1 필수 보고 · ${item.reason}`;
+          item.reason = `예약 실패 · 최소 P1 필수 보고 · ${item.reason}`;
         }
         return Object.fromEntries(Object.entries(item).map(([key, value]) => [key, typeof value === "string" ? value.replace(/\bsourceContext\b/g, "커밋 소스") : value]));
       });
@@ -1200,9 +1228,11 @@ export function renderReport(issues, analysis, window) {
       .sort((left, right) => ["P0", "P1", "P2", "P3"].indexOf(left.priority) - ["P0", "P1", "P2", "P3"].indexOf(right.priority))
       .map((item) => {
         const issue = issueByKey.get(item.issueKey);
+        const workflow = issue.eventEvidence?.samples.find((sample) => sample.reservationWorkflow);
         return [
           `**[${item.priority}] ${issue.shortId || issue.id}**`,
           oneLine(issue.title, 220),
+          workflow ? `대표 ${workflow.reservationWorkflow}\n예약 이벤트: ${workflow.url}` : "",
           `관측: ${issue.level || "error"} · 구간 ${issue.count || 0}건 · 영향 사용자 ${issue.userCount || 0}명 · 마지막 ${formatKst(new Date(issue.lastSeen))}`,
           issue.eventEvidence ? `이벤트 분포: ${oneLine(issue.eventEvidence.variants.map(([variant, count]) => `${variant} ${count}건`).join(" / "), 300)}${issue.eventEvidence.complete ? "" : " (부분 수집/집계 불일치)"}` : "",
           `판단: ${oneLine(item.reason, 240)}`,
@@ -1256,7 +1286,8 @@ export async function main(env = process.env) {
     ]);
     return { regular, warnings };
   }));
-  const regular = selectIssues(groups.flatMap((group) => group.regular), config, window);
+  // 원문에서 예약 워크플로를 판별한 뒤 보고 한도를 적용해야 오래된 예약 오류도 누락되지 않는다.
+  const regular = selectIssues(groups.flatMap((group) => group.regular), { ...config, maxIssues: Infinity }, window);
   // 예약과 무관한 warning이 보고 한도를 소모하지 않도록 원문의 API endpoint를 확인한 뒤 최종 선택한다.
   // ponytail: API warning 후보는 조직 설정당 100그룹까지 확인한다. 초과 시 후보 조회에 페이지 처리를 추가한다.
   const warnings = selectIssues(groups.flatMap((group) => group.warnings), { ...config, maxIssues: Infinity }, window)
