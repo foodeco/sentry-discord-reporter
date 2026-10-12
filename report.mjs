@@ -7,7 +7,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const PROJECT_DIR = fileURLToPath(new URL(".", import.meta.url));
 const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
 const DEFAULT_LEVELS = ["error", "fatal"];
-const DEFAULT_MAX_ISSUES = 30;
 const SENTRY_FETCH_LIMIT = 100;
 const EVENT_FETCH_LIMIT = 1000;
 const EVENT_SAMPLE_LIMIT = 5;
@@ -98,7 +97,9 @@ export function normalizeConfig(raw, env = process.env) {
     levels: new Set(stringArray(raw.levels, "levels", DEFAULT_LEVELS).map((level) => level.toLowerCase())),
     ignoreContains: stringArray(raw.ignoreContains, "ignoreContains").map((value) => value.toLowerCase()),
     ignoredIssueIds: new Set(stringArray(raw.ignoredIssueIds, "ignoredIssueIds")),
-    maxIssues: positiveInteger(env.MAX_ISSUES_PER_RUN, DEFAULT_MAX_ISSUES, 100),
+    maxIssues: env.MAX_ISSUES_PER_RUN === undefined || env.MAX_ISSUES_PER_RUN === null || env.MAX_ISSUES_PER_RUN === ""
+      ? Number.POSITIVE_INFINITY
+      : positiveInteger(env.MAX_ISSUES_PER_RUN, Number.POSITIVE_INFINITY),
   };
 }
 
@@ -243,6 +244,28 @@ async function fetchOrganizationIssues(organization, token, window, limit, level
   );
   assert(Array.isArray(issues), `Sentry ${organization.slug} 이슈 응답이 배열이 아닙니다.`);
   return issues.map((issue) => ({ ...issue, __organization: organization, __levelFiltered: Boolean(levels?.size) }));
+}
+
+async function inspectProjectCollection(organization, project, token, window) {
+  const url = new URL(`/api/0/projects/${encodeURIComponent(organization.slug)}/${encodeURIComponent(project)}/events/`, `${organization.baseUrl}/`);
+  const start = new Date(window.end.getTime() - 14 * 24 * 60 * 60 * 1000);
+  url.searchParams.set("start", start.toISOString());
+  url.searchParams.set("end", window.end.toISOString());
+  url.searchParams.set("per_page", "1");
+  url.searchParams.set("full", "false");
+  for (const environment of organization.environments) url.searchParams.append("environment", environment);
+  try {
+    const events = await fetchJson(url, { headers: sentryHeaders(token) }, "Sentry 마지막 저장 이벤트 조회");
+    assert(Array.isArray(events), "이벤트 목록 형식이 올바르지 않습니다.");
+    if (!events.length) return "조회 종료 전 14일간 저장 이벤트 없음 · 실제 무발생, SDK 설정 및 수집 중단 여부 확인 필요";
+    const lastSeen = new Date(events[0].dateCreated);
+    assert(Number.isFinite(lastSeen.getTime()) && lastSeen >= start && lastSeen <= window.end, "마지막 이벤트 시각을 확인할 수 없습니다.");
+    return `마지막 저장 이벤트: ${formatKst(lastSeen)} KST · ${lastSeen >= window.start
+      ? "조회 구간에 저장 이벤트 있음 · 보고 조건 또는 노이즈 분류로 보고 0건"
+      : "조회 구간에 저장 이벤트 없음 · 실제 무발생 또는 수집 중단 가능성 확인 필요"}`;
+  } catch (error) {
+    return `수집 상태 미확인 · 마지막 저장 이벤트 조회 실패${error.status ? ` (HTTP ${error.status})` : ""} · 권한·설정·API 상태 확인 필요`;
+  }
 }
 
 function issueText(issue) {
@@ -972,7 +995,7 @@ async function analyzeIssues(issues, window, env = process.env, sourceRoot) {
   return { summary: "AI 분석을 사용할 수 없어 규칙 기반으로 분류했습니다.", sourceEvidenceUsed: false, issues: fallbackIssues, mode: "rules-fallback" };
 }
 
-async function analyzeProjects(config, issues, window, env) {
+async function analyzeProjects(config, issues, window, env, tokenConfig) {
   const results = [];
   for (const organization of config.organizations) {
     for (const project of organization.projects) {
@@ -980,7 +1003,9 @@ async function analyzeProjects(config, issues, window, env) {
       const projectIssues = issues.filter((issue) => issue.__organization.slug === organization.slug && projectName(issue) === project);
       if (projectIssues.length) console.log(`프로젝트 분석 중: ${key} (${projectIssues.length}건)`);
       const analysis = await analyzeIssues(projectIssues, window, env, config.sourceRoots[key]);
-      results.push({ key, organization: organization.slug, project, issues: projectIssues, analysis, sourceRoot: config.sourceRoots[key] });
+      const collectionStatus = analysis.issues.some((item) => !item.noise) ? undefined
+        : await inspectProjectCollection(organization, project, tokenFor(organization, tokenConfig), window);
+      results.push({ key, organization: organization.slug, project, issues: projectIssues, analysis, sourceRoot: config.sourceRoots[key], collectionStatus });
     }
   }
   return results;
@@ -996,7 +1021,7 @@ function combineProjectAnalyses(results) {
   return {
     summary: active.length
       ? active.map((result) => `${result.key}: ${result.analysis.summary}`).join(" / ")
-      : "해당 구간에 보고할 오류가 없습니다.",
+      : "보고 조건에 맞는 오류 0건입니다. 수집 상태를 함께 확인하세요.",
     issues: active.flatMap((result) => result.analysis.issues),
     mode: modes.join(", ") || "rules",
     usage: usage.input_tokens || usage.output_tokens ? usage : undefined,
@@ -1043,6 +1068,15 @@ function issueReference(issue) {
 
 function projectFileName(result) {
   return `${result.key.replace(/[^A-Za-z0-9._-]+/g, "__")}.md`;
+}
+
+function collectionStatusBlocks(results) {
+  const checked = results.filter((result) => result.collectionStatus);
+  return checked.length ? [
+    "**보고 0건 프로젝트의 수집 상태**",
+    ...checked.map((result) => `- ${markdownText(result.key, 160)}: ${markdownText(result.collectionStatus, 500)}`),
+    "설정 환경의 모든 레벨·이슈 상태에서 조회한 저장 이벤트의 발생 시각 기준입니다. 할당량은 미조회이며, Sentry Subscription/Stats에서 수집 중단 여부를 확인해야 합니다.",
+  ] : [];
 }
 
 function projectView(result) {
@@ -1141,6 +1175,8 @@ export function renderProjectMarkdown(result, window) {
     "",
     `**보고 ${view.visible.length}건** · P0 ${view.priorities.P0} · P1 ${view.priorities.P1} · P2 ${view.priorities.P2} · P3 ${view.priorities.P3} · 노이즈 ${view.noise.length}건 · 구간 이벤트 ${view.eventCount}건 · 영향 사용자 합계 ${view.userCount}명`,
     "",
+    collectionStatusBlocks([result]).join("\n\n"),
+    "",
     "## 우선순위 개요",
     "",
     overview,
@@ -1169,6 +1205,8 @@ export function renderProjectIndex(results, window) {
     `조회 기간: ${formatKst(window.start)} ~ ${formatKst(window.end)} KST`,
     "",
     `프로젝트 ${results.length}개 · 보고 ${totals.visible}건 · 노이즈 ${totals.noise}건 · 구간 이벤트 ${totals.events}건`,
+    "",
+    collectionStatusBlocks(results).join("\n\n"),
     "",
     "| 프로젝트 | 보고 | P0 | P1 | P2 | P3 | 노이즈 | 분석 방식 | 요약 |",
     "|---|---:|---:|---:|---:|---:|---:|---|---|",
@@ -1206,7 +1244,7 @@ export function chunkDiscordMessages(header, blocks, limit = DISCORD_MESSAGE_LIM
   return messages;
 }
 
-export function renderReport(issues, analysis, window) {
+export function renderReport(issues, analysis, window, projectResults = []) {
   const issueByKey = new Map(issues.map((issue) => [issueKey(issue), issue]));
   const visible = analysis.issues
     .filter((item) => !item.noise && issueByKey.has(item.issueKey));
@@ -1244,6 +1282,7 @@ export function renderReport(issues, analysis, window) {
   ]);
 
   if (!blocks.length) blocks.push("보고 기준을 만족한 오류가 없습니다.");
+  blocks.push(...collectionStatusBlocks(projectResults));
   return chunkDiscordMessages(header, blocks);
 }
 
@@ -1294,10 +1333,10 @@ export async function main(env = process.env) {
     .map((issue) => ({ ...issue, __levelFiltered: false }));
   const candidates = [...new Map([...warnings, ...regular].map((issue) => [issueKey(issue), issue])).values()];
   const enriched = selectIssues(await enrichIssues(candidates, tokenConfig, window), config, window);
-  const projectResults = await analyzeProjects(config, enriched, window, env);
+  const projectResults = await analyzeProjects(config, enriched, window, env, tokenConfig);
   const analysis = combineProjectAnalyses(projectResults);
   const report = await writeProjectReports(projectResults, window, env);
-  const messages = renderReport(enriched, analysis, window);
+  const messages = renderReport(enriched, analysis, window, projectResults);
 
   console.log(`프로젝트 리포트 생성: ${report.indexPath}`);
 

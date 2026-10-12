@@ -161,6 +161,63 @@ test("예약 워크플로의 방향과 사유를 개인정보 없이 보고하�
   for (const privateValue of Object.values(recovery)) assert.ok(!invalidMetadata.includes(privateValue));
 });
 
+test("보고 0건이어도 마지막 저장 시각과 조회 실패를 Markdown·Discord에 구분해 표시한다", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "sentry-collection-test-"));
+  t.after(async () => {
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    await rm(directory, { recursive: true, force: true });
+  });
+  const configPath = join(directory, "targets.json");
+  const projects = ["stale", "recent", "forbidden", "empty", "invalid"];
+  await writeFile(configPath, JSON.stringify({ organizations: [{ slug: "weing", projects, environments: ["production"] }] }));
+  const requested = [];
+  const log = t.mock.method(console, "log", () => {});
+  t.mock.method(globalThis, "fetch", async (input) => {
+    const url = new URL(input);
+    assert.equal(url.hostname, "sentry.io");
+    if (url.pathname.endsWith("/issues/")) {
+      assert.equal(url.searchParams.get("start"), "2026-09-21T01:30:00.000Z", "manual reporting remains 24 hours");
+      return Response.json([]);
+    }
+    const project = url.pathname.match(/\/projects\/weing\/([^/]+)\/events\/$/)?.[1];
+    assert.ok(project, `unexpected request: ${url.pathname}`);
+    requested.push(project);
+    assert.equal(url.searchParams.get("start"), "2026-09-08T01:30:00.000Z");
+    assert.equal(url.searchParams.get("end"), "2026-09-22T01:30:00.000Z");
+    assert.deepEqual(url.searchParams.getAll("environment"), ["production"]);
+    assert.equal(url.searchParams.get("per_page"), "1");
+    assert.equal(url.searchParams.get("full"), "false");
+    assert.equal(url.searchParams.has("query"), false, "resolved issues and info events must remain eligible");
+    if (project === "forbidden") return Response.json({ detail: "private-response" }, { status: 403 });
+    if (project === "empty") return Response.json([]);
+    const dateCreated = project === "stale" ? "2026-09-20T22:32:44Z"
+      : project === "recent" ? "2026-09-22T00:30:00Z" : "invalid";
+    return Response.json([{ dateCreated, level: "info", message: "private-response" }]);
+  });
+  await main({ TARGETS_FILE: configPath, REPORTS_DIR: directory, REPORT_END: "2026-09-22T01:30:00Z",
+    SENTRY_AUTH_TOKEN: "unused-test-token", CODEX_CLI_ANALYSIS: "0", DRY_RUN: "1" });
+  assert.deepEqual(requested, projects);
+  const reportDir = join(directory, "2026-09-22", "1030");
+  const index = await readFile(join(reportDir, "index.md"), "utf8");
+  const discord = log.mock.calls.map((call) => call.arguments.join(" ")).join("\n");
+  const expected = {
+    stale: /마지막 저장 이벤트: 2026\. 09\. 21\. 07:32 KST · 조회 구간에 저장 이벤트 없음/,
+    recent: /조회 구간에 저장 이벤트 있음 · 보고 조건 또는 노이즈 분류로 보고 0건/,
+    forbidden: /수집 상태 미확인.*HTTP 403/,
+    empty: /조회 종료 전 14일간 저장 이벤트 없음/,
+    invalid: /수집 상태 미확인.*조회 실패/,
+  };
+  for (const project of projects) {
+    const markdown = await readFile(join(reportDir, `weing__${project}.md`), "utf8");
+    for (const output of [markdown, index, discord]) {
+      assert.match(output, expected[project]);
+      assert.match(output, /할당량은 미조회/);
+      assert.doesNotMatch(output, /private-response/);
+    }
+  }
+  assert.doesNotMatch(discord, /할당량 소진으로 중단되었습니다|수집 정상/);
+});
+
 test("09시 예약은 전날 20시부터 당일 09시까지 조회한다", () => {
   const window = computeWindow({ slot: "09", now: new Date("2026-08-22T00:05:00.000Z") });
   assert.equal(window.start.toISOString(), "2026-08-21T11:00:00.000Z");
@@ -276,6 +333,31 @@ test("노이즈·낮은 레벨·오래된 이슈를 제거하고 조직별 ID로
 
   assert.equal(selected.length, 1);
   assert.equal(selected[0].lastSeen, "2026-08-22T03:00:00Z");
+});
+
+test("보고 건수를 지정하지 않으면 선별 결과를 30건에서 자르지 않는다", () => {
+  const raw = { organizations: [{ slug: "weing", projects: ["api"] }], levels: ["error"] };
+  const unlimited = normalizeConfig(raw, {});
+  const capped = normalizeConfig(raw, { MAX_ISSUES_PER_RUN: "30" });
+  const organization = unlimited.organizations[0];
+  const window = { start: new Date("2026-08-22T00:00:00Z"), end: new Date("2026-08-22T05:00:00Z") };
+  const issues = Array.from({ length: 40 }, (_, index) => ({
+    __organization: organization,
+    project: { slug: "api" },
+    status: "unresolved",
+    count: "1",
+    userCount: 0,
+    id: String(index + 1),
+    shortId: `API-${index + 1}`,
+    title: `error ${index + 1}`,
+    level: "error",
+    firstSeen: "2026-08-22T01:00:00Z",
+    lastSeen: "2026-08-22T02:00:00Z",
+  }));
+
+  assert.equal(unlimited.maxIssues, Number.POSITIVE_INFINITY);
+  assert.equal(selectIssues(issues, unlimited, window).length, 40);
+  assert.equal(selectIssues(issues, capped, window).length, 30);
 });
 
 test("Discord 메시지는 지정 길이를 넘지 않는다", () => {

@@ -40,7 +40,8 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.6-luna
 CODEX_CLI_ANALYSIS=1
-MAX_ISSUES_PER_RUN=30
+# 비우면 조회된 이슈를 모두 보고합니다. 숫자를 넣으면 그 건수만 우선순위로 남깁니다.
+# MAX_ISSUES_PER_RUN=
 REPORTS_DIR=reports
 DRY_RUN=0
 ```
@@ -118,6 +119,8 @@ npm start
 
 기본 수동 조회 범위는 최근 24시간입니다.
 
+보고가 0건인 프로젝트는 조회 종료 시각 전 14일 범위에서 마지막 저장 이벤트를 추가 확인합니다. 설정한 환경을 유지하고 레벨·해결 상태 필터를 해제해, 보고 대상이 없는 경우와 저장 이벤트 자체가 없는 경우를 Markdown·Discord에서 구분합니다. 마지막 시각은 저장된 이벤트의 발생 시각이며 실제 무발생과 수집 중단을 확정적으로 구별하지는 않습니다. 조회 권한이나 API 오류는 `수집 상태 미확인`으로 표시합니다. 할당량은 별도 조회하지 않으므로 Sentry Subscription/Stats에서 확인해야 합니다. 이 확인은 Errors 이벤트 대상이며 Spans 수집 상태를 나타내지 않습니다.
+
 ### 조회 범위 지정
 
 ```powershell
@@ -142,13 +145,13 @@ Remove-Item Env:DRY_RUN
 
 리포트 조회 구간의 이벤트를 페이지 단위로 읽습니다. 이슈의 대표 제목과 전체 건수만으로 오류 유형을 판단하지 않습니다. 예를 들어 제목이 `status code 500`인 그룹 안에 `404 warning 35건 + 500 error 1건`이 있으면 두 유형의 건수를 따로 표시합니다. 구간 밖의 `events/latest/`는 사용하지 않습니다.
 
-보고 대상의 레벨 조건은 Sentry 검색 `level:[error,fatal]`처럼 구간 이벤트에 적용합니다. 그룹의 대표 레벨이 나중에 warning으로 바뀌어도 구간 안의 error가 누락되지 않습니다. 신규 여부는 전체 이력의 `lifetime.firstSeen`을 우선 사용하고 구간 첫 발생과 구분합니다. 조직 설정당 이슈 최대 100건을 조회하고 `MAX_ISSUES_PER_RUN`(기본 30)만큼 우선순위에 따라 보고하므로, 전체 점검에는 이 값을 100까지 늘릴 수 있습니다.
+보고 대상의 레벨 조건은 Sentry 검색 `level:[error,fatal]`처럼 구간 이벤트에 적용합니다. 그룹의 대표 레벨이 나중에 warning으로 바뀌어도 구간 안의 error가 누락되지 않습니다. 신규 여부는 전체 이력의 `lifetime.firstSeen`을 우선 사용하고 구간 첫 발생과 구분합니다. 조직 설정당 이슈 최대 100건을 조회하고, `MAX_ISSUES_PER_RUN`을 비우면 그 후보를 모두 보고합니다. 값을 지정하면 그 건수만 우선순위에 따라 남깁니다.
 
-예약 API 실패는 원본이 `warning`이어도 별도로 수집해 **최소 P1로 보고**합니다. `api_source` 태그가 있는 warning을 조직 설정당 최대 100그룹 조회하고, 대표 이벤트의 실제 API endpoint에 `/reservation`, `/reservations`, `/reservation-api/` 경로가 있는지 확인합니다. 예약 생성·조회·연결 API가 대상이며, 예약 페이지에서 발생한 단순 입력 누락 경고는 이 예외에 포함하지 않습니다. 예약 API 오류는 AI가 노이즈나 낮은 우선순위로 분류해도 보고에 유지합니다. 명시한 무시 규칙·해결 상태 필터·최종 보고 건수 한도는 유지하며 Sentry 원본 레벨은 변경하지 않습니다.
+예약 API 실패는 원본이 `warning`이어도 별도로 수집해 **최소 P1로 보고**합니다. `api_source` 태그가 있는 warning을 조직 설정당 최대 100그룹 조회하고, 대표 이벤트의 실제 API endpoint에 `/reservation`, `/reservations`, `/reservation-api/` 경로가 있는지 확인합니다. 예약 생성·조회·연결 API가 대상이며, 예약 페이지에서 발생한 단순 입력 누락 경고는 이 예외에 포함하지 않습니다. 예약 API 오류는 AI가 노이즈나 낮은 우선순위로 분류해도 보고에 유지합니다. 명시한 무시 규칙과 해결 상태 필터는 유지합니다. `MAX_ISSUES_PER_RUN`을 지정한 경우에만 최종 보고 건수를 제한하며, Sentry 원본 레벨은 변경하지 않습니다.
 
 `operation=cart-reservation.submit`인 예약 워크플로 오류도 최소 P1로 보고합니다. 스마트닥터·위잉의 예약 확인 방향, 실패 단계·상태·사유와 Sentry 이벤트 링크를 표시합니다. `smart-doctor-only`나 `none`은 응답으로 확인한 결과이며, 타임아웃 시 실제 DB에 예약이 없다는 뜻은 아닙니다. 복구용 고객번호·이름·연락처는 Sentry에서 확인하고 Discord·AI 입력에는 복제하지 않습니다.
 
-보고 건수 한도에서는 P0, 예약 API·워크플로 실패, 나머지 이슈 순으로 선택합니다. 오래된 워크플로 오류가 원문 확인 전에 제외되지 않도록 조회한 후보를 먼저 분석한 뒤 최종 한도를 적용합니다. 따라서 실제 보고 건수보다 많은 후보의 이벤트 상세를 조회할 수 있습니다. Sentry 후보 조회는 조직 설정별 쿼리당 최대 100그룹이며, 그 밖의 예약 오류는 후속 페이지 조회를 추가해야 수집할 수 있습니다.
+`MAX_ISSUES_PER_RUN`을 지정하면 P0, 예약 API·워크플로 실패, 나머지 이슈 순으로 그 건수를 선택합니다. 오래된 워크플로 오류가 원문 확인 전에 제외되지 않도록 조회한 후보를 먼저 분석한 뒤 최종 한도를 적용합니다. 따라서 한도를 둔 실행은 실제 보고 건수보다 많은 후보의 이벤트 상세를 조회할 수 있습니다. Sentry 후보 조회는 조직 설정별 쿼리당 최대 100그룹이며, 그 밖의 예약 오류는 후속 페이지 조회를 추가해야 수집할 수 있습니다.
 
 스마트닥터와 위잉의 예약 결과는 확보된 응답 근거로 판단합니다. 한쪽 실패만 기록되어 있거나 통신 상세가 삭제된 경우, 반대편을 성공으로 간주하지 않습니다.
 
@@ -158,6 +161,7 @@ Remove-Item Env:DRY_RUN
 | [Issue Event](https://docs.sentry.io/api/events/retrieve-an-issue-event/) | 예외·스택, API 상태/전송 코드, locale, 응답 오류 code/message/detail, 요청, 통신·이동 Breadcrumbs, SDK, Trace/Replay 링크 | `event:read` |
 | [Trace](https://docs.sentry.io/api/discover/retrieve-a-trace/) | 반환된 span과 연결 오류 수, 오래 걸린 span의 프로젝트·연산·시간 | `org:read` |
 | [Source Map Debug](https://docs.sentry.io/api/events/get-debug-information-related-to-source-maps-for-a-given-event/) | debug ID·artifact bundle·release artifact 유무, 대응 소스맵이 없는 프레임 수 | `project:read` |
+| [Project Error Events](https://docs.sentry.io/api/events/list-a-projects-error-events/) | 보고 0건 프로젝트의 마지막 저장 이벤트 시각(조회 종료 전 14일 이내) | `project:read` |
 
 - 이슈당 이벤트 목록 최대 1,000건, 대표 원문 최대 5건을 조회합니다. 원문은 레벨·메시지 유형, 메서드, 릴리스, 경로, 브라우저 순으로 다른 사례를 선택합니다. 비율은 대표 원문이 아닌 확보한 이벤트 목록에서 계산합니다.
 - 분포는 상위 8종, 스택은 예외당 마지막 12프레임, 통신·이동 Breadcrumbs는 마지막 8건까지 표시합니다. 원문 발췌는 이벤트당 8,000자, AI 입력은 대표 이벤트당 2,500자까지입니다. 잘린 경우 표시합니다.
