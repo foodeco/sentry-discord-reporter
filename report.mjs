@@ -19,6 +19,7 @@ const ANALYSIS_INSTRUCTIONS = [
   "이슈 제목은 그룹 대표값입니다. 구간 이벤트의 레벨·메시지 분포를 우선하고, 서로 다른 오류가 섞이면 원인과 조치를 나누세요. 대표 이벤트 비율을 전체 비율로 간주하지 마세요.",
   "Trace 권한 부족, 소스맵 누락, 표본 한도 등 수집 한계를 원인과 구분하세요. 마스킹된 URL이나 ID를 실제 잘못된 요청 값으로 단정하지 마세요.",
   "동일 이슈는 입력 issueKey를 그대로 유지하세요.",
+  "summary는 noise가 아닌 이슈를 공통 증상이나 영향받은 기능별로 묶어 최대 세 문장으로 종합하세요. 가장 영향이 큰 문제와 먼저 확인할 조치를 우선하고, 관측과 추정을 구분하며 건수나 공통 원인을 지어내지 마세요.",
   "analysis에는 예외 메시지와 애플리케이션 스택을 근거로 추정 원인을 쓰고, 근거가 부족하면 확인 불가라고 명시하세요.",
   "nextAction에는 즉시 확인할 위치, 수정 방향, 수정 후 검증 방법을 구체적으로 쓰세요.",
   "degraded_mode=true는 호출자가 명시적 폴백으로 처리한 오류입니다. 별도의 렌더 실패 근거가 없으면 P1으로 분류하지 마세요.",
@@ -1011,23 +1012,6 @@ async function analyzeProjects(config, issues, window, env, tokenConfig) {
   return results;
 }
 
-function combineProjectAnalyses(results) {
-  const active = results.filter((result) => result.issues.length);
-  const modes = [...new Set(active.map((result) => result.analysis.mode))];
-  const usage = active.reduce((total, result) => ({
-    input_tokens: total.input_tokens + Number(result.analysis.usage?.input_tokens || 0),
-    output_tokens: total.output_tokens + Number(result.analysis.usage?.output_tokens || 0),
-  }), { input_tokens: 0, output_tokens: 0 });
-  return {
-    summary: active.length
-      ? active.map((result) => `${result.key}: ${result.analysis.summary}`).join(" / ")
-      : "보고 조건에 맞는 오류 0건입니다. 수집 상태를 함께 확인하세요.",
-    issues: active.flatMap((result) => result.analysis.issues),
-    mode: modes.join(", ") || "rules",
-    usage: usage.input_tokens || usage.output_tokens ? usage : undefined,
-  };
-}
-
 function formatKst(date) {
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul",
@@ -1244,45 +1228,52 @@ export function chunkDiscordMessages(header, blocks, limit = DISCORD_MESSAGE_LIM
   return messages;
 }
 
-export function renderReport(issues, analysis, window, projectResults = []) {
-  const issueByKey = new Map(issues.map((issue) => [issueKey(issue), issue]));
-  const visible = analysis.issues
-    .filter((item) => !item.noise && issueByKey.has(item.issueKey));
-  const noiseCount = analysis.issues.length - visible.length;
+export function renderReport(results, window) {
+  const views = results.map((result) => ({ result, view: projectView(result) }));
+  const active = views.filter(({ view }) => view.visible.length);
+  const totals = views.reduce((total, { view }) => ({
+    issues: total.issues + view.visible.length,
+    noise: total.noise + view.noise.length,
+    urgent: total.urgent + view.priorities.P0 + view.priorities.P1,
+  }), { issues: 0, noise: 0, urgent: 0 });
   const header = [
-    "**Sentry 오류 리포트**",
+    "**Sentry 오류 요약 리포트**",
     `기간: ${formatKst(window.start)} ~ ${formatKst(window.end)} KST`,
-    `분석: ${analysis.mode} · 조회 ${issues.length}건 · 노이즈 제외 ${noiseCount}건 · 보고 ${visible.length}건`,
-    `요약: ${oneLine(analysis.summary, 500)}`,
+    `보고 ${totals.issues}개 이슈 (${active.length}/${results.length}개 프로젝트) · P0/P1 ${totals.urgent}개 · 노이즈 제외 ${totals.noise}개`,
   ].join("\n");
-
-  const grouped = Map.groupBy(visible, (item) => {
-    const issue = issueByKey.get(item.issueKey);
-    return `${issue.__organization.slug}/${projectName(issue)}`;
+  const blocks = active.flatMap(({ result, view }) => {
+    const issues = view.visible.map((item) => view.issueByKey.get(item.issueKey));
+    const variants = new Map();
+    for (const issue of issues) {
+      for (const [variant, count] of issue.eventEvidence?.variants || []) {
+        variants.set(variant, (variants.get(variant) || 0) + count);
+      }
+    }
+    const topVariants = [...variants].sort((left, right) => right[1] - left[1]).slice(0, 3)
+      .map(([variant, count]) => `${markdownText(variant, 85)} ${count}건`);
+    const bookings = issues.filter(isReservationIssue);
+    const workflowSamples = bookings.flatMap((issue) => issue.eventEvidence.samples.filter((sample) => sample.reservationWorkflow));
+    const workflows = [...Map.groupBy(workflowSamples, (sample) => sample.reservationWorkflow).entries()].slice(0, 3)
+      .map(([observation, samples]) => `${markdownText(observation, 180)} [대표 이벤트](${safeUrl(samples[0].url)})`);
+    const urgent = view.visible.filter((item) => item.priority === "P0" || item.priority === "P1").slice(0, 3)
+      .map((item) => `${item.priority} ${issueReference(view.issueByKey.get(item.issueKey))}`);
+    const priorities = Object.entries(view.priorities).filter(([, count]) => count > 0)
+      .map(([priority, count]) => `${priority} ${count}`).join(" · ");
+    const eventCount = issues.reduce((sum, issue) => sum + (Number(issue.count) || 0), 0);
+    const project = markdownText(result.key, 120);
+    const summary = [
+      `**${project}** · ${priorities} · 보고 이슈의 구간 이벤트 ${eventCount}건`,
+      markdownText(result.analysis.summary, 400),
+      topVariants.length ? `주요 이벤트 유형 (확보분): ${topVariants.join(" / ")}` : "",
+      issues.some((issue) => !issue.eventEvidence?.complete) ? "일부 이벤트 목록 미확보 또는 집계 불일치" : "",
+      bookings.length ? `예약 실패 이슈 ${bookings.length}개` : "",
+      urgent.length ? `우선 확인: ${urgent.join(" · ")}` : "",
+    ].filter(Boolean).join("\n");
+    return workflows.length ? [summary, [`**${project} 예약 워크플로 관측**`, ...workflows].join("\n")] : [summary];
   });
-  const blocks = [...grouped.entries()].flatMap(([project, items]) => [
-    `__**${project}**__ · 보고 ${items.length}건`,
-    ...items
-      .sort((left, right) => ["P0", "P1", "P2", "P3"].indexOf(left.priority) - ["P0", "P1", "P2", "P3"].indexOf(right.priority))
-      .map((item) => {
-        const issue = issueByKey.get(item.issueKey);
-        const workflow = issue.eventEvidence?.samples.find((sample) => sample.reservationWorkflow);
-        return [
-          `**[${item.priority}] ${issue.shortId || issue.id}**`,
-          oneLine(issue.title, 220),
-          workflow ? `대표 ${workflow.reservationWorkflow}\n예약 이벤트: ${workflow.url}` : "",
-          `관측: ${issue.level || "error"} · 구간 ${issue.count || 0}건 · 영향 사용자 ${issue.userCount || 0}명 · 마지막 ${formatKst(new Date(issue.lastSeen))}`,
-          issue.eventEvidence ? `이벤트 분포: ${oneLine(issue.eventEvidence.variants.map(([variant, count]) => `${variant} ${count}건`).join(" / "), 300)}${issue.eventEvidence.complete ? "" : " (부분 수집/집계 불일치)"}` : "",
-          `판단: ${oneLine(item.reason, 240)}`,
-          `원인: ${oneLine(item.analysis, 320)}`,
-          `조치: ${oneLine(item.nextAction, 240)}`,
-          issue.permalink || "",
-        ].filter(Boolean).join("\n");
-      }),
-  ]);
 
   if (!blocks.length) blocks.push("보고 기준을 만족한 오류가 없습니다.");
-  blocks.push(...collectionStatusBlocks(projectResults));
+  blocks.push(...collectionStatusBlocks(results));
   return chunkDiscordMessages(header, blocks);
 }
 
@@ -1334,14 +1325,17 @@ export async function main(env = process.env) {
   const candidates = [...new Map([...warnings, ...regular].map((issue) => [issueKey(issue), issue])).values()];
   const enriched = selectIssues(await enrichIssues(candidates, tokenConfig, window), config, window);
   const projectResults = await analyzeProjects(config, enriched, window, env, tokenConfig);
-  const analysis = combineProjectAnalyses(projectResults);
   const report = await writeProjectReports(projectResults, window, env);
-  const messages = renderReport(enriched, analysis, window, projectResults);
+  const messages = renderReport(projectResults, window);
 
   console.log(`프로젝트 리포트 생성: ${report.indexPath}`);
 
-  if (analysis.usage) {
-    console.log(`OpenAI 토큰 사용량: input=${analysis.usage.input_tokens || 0}, output=${analysis.usage.output_tokens || 0}`);
+  const usage = projectResults.reduce((total, { analysis }) => ({
+    input: total.input + Number(analysis.usage?.input_tokens || 0),
+    output: total.output + Number(analysis.usage?.output_tokens || 0),
+  }), { input: 0, output: 0 });
+  if (usage.input || usage.output) {
+    console.log(`OpenAI 토큰 사용량: input=${usage.input}, output=${usage.output}`);
   }
   if (env.DRY_RUN === "1") {
     console.log(messages.join("\n\n---\n\n"));

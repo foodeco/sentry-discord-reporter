@@ -145,8 +145,10 @@ test("예약 워크플로의 방향과 사유를 개인정보 없이 보고하�
     for (const privateValue of Object.values(recovery)) assert.ok(!output.includes(privateValue));
   }
   assert.match(markdown, /P1 3/);
-  assert.match(discord, /\[P1\] WORKFLOW-sd-only/);
-  assert.match(discord, /예약 이벤트: https:\/\/sentry\.io\/organizations\/weing\/issues\/sd-only\/events\/sd-only\//);
+  assert.match(discord, /예약 실패 이슈 3개/);
+  assert.match(discord, /주요 이벤트 유형 .*Reservation workflow failed 3건/);
+  assert.match(discord, /\[대표 이벤트\]\(https:\/\/sentry\.io\/organizations\/weing\/issues\/sd-only\/events\/sd-only\//);
+  assert.doesNotMatch(discord, /\[P1\] WORKFLOW-|판단:|원인:|조치:/);
 
   const window = { start: new Date("2026-09-10T11:00:00Z"), end: new Date("2026-09-11T00:00:00Z") };
   const issue = { ...issues.at(-1), __organization: { slug: "weing", baseUrl: "https://sentry.io", environments: [] } };
@@ -438,41 +440,7 @@ test("혼합 오류의 일부 폴백 태그로 전체 이슈의 우선순위를 
   assert.equal(ruleResult(issue, window).priority, "P1");
 });
 
-test("AI 분석 결과를 원인과 조치로 구분해 Discord에 표시한다", () => {
-  const organization = { slug: "weing" };
-  const issue = {
-    __organization: organization,
-    id: "1",
-    shortId: "API-1",
-    project: { slug: "api" },
-    title: "Database unavailable",
-    level: "error",
-    count: "3",
-    userCount: 2,
-    lastSeen: "2026-08-22T02:00:00Z",
-    permalink: "https://sentry.io/issues/1",
-  };
-  const analysis = {
-    mode: "Codex CLI (ChatGPT)",
-    summary: "DB 연결 오류",
-    issues: [{
-      issueKey: "weing:1",
-      priority: "P1",
-      noise: false,
-      reason: "신규 오류",
-      analysis: "연결 풀이 고갈된 것으로 추정됩니다.",
-      nextAction: "풀 사용량을 확인하고 누수를 수정한 뒤 부하 테스트하세요.",
-    }],
-  };
-  const window = { start: new Date("2026-08-22T00:00:00Z"), end: new Date("2026-08-22T03:00:00Z") };
-
-  const report = renderReport([issue], analysis, window).join("\n");
-
-  assert.match(report, /원인: 연결 풀이 고갈/);
-  assert.match(report, /조치: 풀 사용량을 확인/);
-});
-
-test("프로젝트별 Markdown에 현황, 원인, 조치와 Sentry 링크를 종합한다", () => {
+test("Discord에는 프로젝트 요약과 우선 확인 링크를 보내고 상세 분석은 Markdown에 남긴다", () => {
   const organization = { slug: "weing" };
   const issue = {
     __organization: organization,
@@ -511,12 +479,18 @@ test("프로젝트별 Markdown에 현황, 원인, 조치와 Sentry 링크를 종
 
   const report = renderProjectMarkdown(result, window);
   const index = renderProjectIndex([result], window);
+  const discord = renderReport([result], window).join("\n");
 
   assert.match(report, /보고 1건.*P1 1.*구간 이벤트 8건/);
   assert.match(report, /추정 원인: src\/db\.ts/);
   assert.match(report, /권장 조치: 풀 사용량/);
   assert.match(report, /\[API-1\]\(https:\/\/sentry\.io\/issues\/1\)/);
   assert.match(index, /\.\/weing__api\.md/);
+  assert.match(discord, /보고 1개 이슈 \(1\/1개 프로젝트\) · P0\/P1 1개/);
+  assert.match(discord, /weing\/api.*P1 1.*구간 이벤트 8건/);
+  assert.match(discord, /DB 연결 실패가 집중 발생했습니다/);
+  assert.match(discord, /우선 확인: P1 \[API-1\]\(https:\/\/sentry\.io\/issues\/1\)/);
+  assert.doesNotMatch(discord, /Database unavailable|src\/db\.ts|풀 사용량/);
 });
 
 test("구간 페이지의 희귀 500·HEAD와 혼합 레벨을 원문·진단 근거로 보고하고 비밀값은 제외한다", async (t) => {
@@ -597,7 +571,7 @@ test("구간 페이지의 희귀 500·HEAD와 혼합 레벨을 원문·진단 �
   assert.match(report, /&lt;\/pre&gt;&lt;script&gt;/);
   assert.doesNotMatch(report, /<script>|private-patient|user@example\.com|(?:path|endpoint|json|url|query|header|cookie|body|crumb|encoded)-secret|crumb-body-secret/);
   assert.match(report, /https:\/\/example\.com\/api\/places 500/);
-  assert.match(renderReport([enriched], result.analysis, window).join("\n"), /이벤트 분포:.*404 35건/);
+  assert.match(renderReport([result], window).join("\n"), /주요 이벤트 유형 .*404 35건/);
   analysis.noise = true;
   assert.match(renderProjectMarkdown(result, window), /대표 이벤트 1/);
   await fetchIssueEvidence(issue, "unused-test-token", window, traceCache);

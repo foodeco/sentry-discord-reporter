@@ -8,10 +8,10 @@
 - Discord Webhook 조회·실제 메시지 전송 검증 완료
 - 수동 실행 및 로컬 Codex AI 원인·조치 분석 가능
 - 프로젝트별 Markdown에 이벤트 분포·응답 오류·스택·Breadcrumbs·Trace/소스맵 진단 수록
-- GitHub Actions 예약: 매일 09:00, 20:00 KST
-- Windows 예약 작업 등록은 아직 미완료
+- Discord에는 전체 현황, 프로젝트별 종합 요약, 우선 확인할 Sentry 링크 전송
+- Orca 자동화 예약: 매일 09:00, 20:00 KST
 
-OpenAI API 키가 있으면 Responses API를 우선 사용합니다. 키가 없거나 호출에 실패하면 로그인된 로컬 Codex CLI로 원인과 조치를 분석하고, 두 방법 모두 사용할 수 없을 때만 규칙 기반 리포트로 동작합니다. 현재 로그인된 ChatGPT/Codex 계정은 GitHub-hosted Actions에서 그대로 사용할 수 없습니다.
+로컬 소스가 연결된 프로젝트는 Codex CLI로 커밋 소스와 Sentry 이벤트를 함께 분석합니다. 소스 분석을 사용할 수 없으면 설정된 OpenAI API 또는 로컬 Codex CLI로 Sentry 이벤트를 분석합니다. AI 분석이 실패하면 규칙 기반 리포트를 생성합니다.
 
 ## 요구 사항
 
@@ -141,6 +141,8 @@ Remove-Item Env:DRY_RUN
 
 실행할 때마다 `reports/YYYY-MM-DD/HHmm/index.md`와 프로젝트별 상세 문서가 생성됩니다. 인덱스에는 프로젝트별 P0~P3, 노이즈, 이벤트 수와 요약이 표시되고, 상세 문서에는 각 이슈의 관측 사실·추정 원인·권장 조치·Sentry 링크가 기록됩니다. `REPORTS_DIR`로 출력 루트를 바꿀 수 있습니다.
 
+Discord 리포트는 전체 이슈 수와 P0/P1 현황으로 시작합니다. 프로젝트별로 공통 증상과 우선 조치를 요약하고, 확보한 이벤트 중 많이 관측된 유형 최대 3개와 P0/P1 이슈 최대 3개의 확인 링크를 표시합니다. 예약 실패 이슈 수와 대표 워크플로 결과, 보고 0건 프로젝트의 수집 상태도 함께 표시합니다. AI를 사용할 수 없는 실행은 집계와 관측 결과를 보냅니다.
+
 ### 상세 근거 수집
 
 리포트 조회 구간의 이벤트를 페이지 단위로 읽습니다. 이슈의 대표 제목과 전체 건수만으로 오류 유형을 판단하지 않습니다. 예를 들어 제목이 `status code 500`인 그룹 안에 `404 warning 35건 + 500 error 1건`이 있으면 두 유형의 건수를 따로 표시합니다. 구간 밖의 `events/latest/`는 사용하지 않습니다.
@@ -174,41 +176,32 @@ API는 Sentry에 이미 저장된 데이터를 조회합니다. 백엔드의 어
 
 ## 예약 실행
 
-### GitHub Actions
+### Orca 자동화
 
-`.github/workflows/sentry-report.yml`은 `Asia/Seoul` 시간대로 다음 시각에 예약됩니다.
+Orca의 `Sentry Discord 요약 09:00` 및 `Sentry Discord 요약 20:00` 예약은 이 저장소의 기존 로컬 워크스페이스에서 실행합니다. `REPORT_SLOT=09`는 전날 20시부터 당일 09시까지, `REPORT_SLOT=20`은 당일 09시부터 20시까지 조회합니다. 저장소의 `.env`로 Sentry와 Discord에 연결하고, ChatGPT로 로그인한 로컬 Codex CLI로 요약합니다. 별도 OpenAI API 키가 필요하지 않습니다. 로컬 Orca 스케줄러가 동작하는 장비에서 실행됩니다.
 
-- 09:00 KST
-- 20:00 KST
+각 예약은 워크스페이스에서 다음 PowerShell 명령을 한 번 실행합니다. 20시 예약에는 `REPORT_SLOT`을 `20`으로 설정합니다. 미리보기에서는 `DRY_RUN`을 `1`로 지정합니다.
 
-09시 보고는 전날 20시부터 당일 09시까지, 20시 보고는 당일 09시부터 20시까지 조회합니다.
+```powershell
+$env:REPORT_SLOT = '09'
+$env:CODEX_CLI_ANALYSIS = '1'
+$env:DRY_RUN = '0'
+npm start
+```
 
-GitHub 예약 이벤트 생성과 러너 배정은 지연될 수 있어 정각 수신을 보장하지 않습니다. [GitHub 예약 실행 안내](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+정기 실행에 사용하는 `.env`와 프로세스 환경에는 `REPORT_END`, `LOOKBACK_HOURS`를 지정하지 않습니다.
 
-각 실행은 다른 보고의 완료를 기다리지 않고 러너를 요청합니다. 조회 기준은 GitHub 실행의 `created_at`에 고정하므로, 러너가 다음 날 시작하거나 같은 실행을 재시도해도 구간이 바뀌지 않습니다. 예약 구간은 생성 시각 이전의 가장 가까운 해당 슬롯을 선택합니다. 생성 시각을 조회하지 못하면 잘못된 구간으로 전송하지 않고 실패합니다. `GITHUB_TOKEN`은 Actions가 자동 제공하며 `actions: read` 권한으로 실행 정보만 읽습니다.
+### 누락 구간 수동 복구
 
-예약 이벤트 자체가 하루 이상 늦게 생성되거나 누락된 경우에는 원래 날짜를 자동 복구하지 않습니다. 아래 수동 구간 지정으로 복구합니다.
+`REPORT_END`에 시간대를 포함한 조회 종료 시각을 지정합니다. `LOOKBACK_HOURS`는 오전 보고에 `13`, 저녁 보고에 `11`을 사용합니다. 예를 들어 9월 13일 오전 보고를 미리 보려면 다음과 같이 실행합니다. Discord 전송 시에는 `DRY_RUN`을 `0`으로 지정합니다.
 
-원격 저장소의 **Settings → Secrets and variables → Actions**에 다음 Repository Secret을 등록합니다.
-
-| Secret | 필수 | 용도 |
-|---|---:|---|
-| `SENTRY_TOKENS_JSON` | 여러 조직일 때 | 조직 slug별 Auth Token JSON |
-| `SENTRY_AUTH_TOKEN` | 한 조직일 때 | 단일 조직 Auth Token |
-| `DISCORD_WEBHOOK_URL` | 예 | Discord 전송 |
-| `OPENAI_API_KEY` | 아니요 | OpenAI API 분석 |
-
-Actions 화면의 **Run workflow**로 예약 시간 외 수동 실행도 가능합니다.
-
-- `lookback_hours`: 조회할 시간 수(1~168, 기본 24).
-- `report_end`: 선택 사항. 시간대를 포함한 과거 종료 시각. 생략하면 GitHub 실행 생성 시각을 사용합니다.
-- `dry_run`: 선택하면 Discord 전송 없이 보고서를 생성하고 artifact로 보관합니다. Sentry 조회와 설정된 AI 분석은 수행합니다.
-
-예를 들어 9/13 오전 보고를 복구하려면 `report_end=2026-09-13T09:00:00+09:00`, `lookback_hours=13`을 지정합니다. 저녁 보고는 `report_end=2026-09-13T20:00:00+09:00`, `lookback_hours=11`입니다. 로컬에서도 `REPORT_END`와 `LOOKBACK_HOURS` 환경변수로 같은 구간을 지정할 수 있습니다.
-
-기존에 대기 중인 실행은 수정 전 workflow를 사용합니다. 연쇄 대기 복구 시에는 뒤쪽 pending 실행부터 취소하고 앞쪽 queued 실행도 취소한 뒤, 수정본으로 새 수동 실행을 만듭니다. `dry_run`으로 러너 배정과 조회 구간을 확인한 다음 같은 구간으로 전송합니다. 새 실행도 러너를 받지 못하면 GitHub의 러너 배정 문제는 여전히 남아 있는 것입니다.
-
-GitHub-hosted Actions에는 로컬의 ChatGPT 로그인과 형제 소스 저장소가 없으므로, 기본 설정에서는 OpenAI API 또는 규칙 기반 분석을 사용합니다. 생성 문서를 Actions에서 보관하려면 워크플로의 artifact 업로드 단계를 사용합니다.
+```powershell
+$env:REPORT_END = '2026-09-13T09:00:00+09:00'
+$env:LOOKBACK_HOURS = '13'
+$env:DRY_RUN = '1'
+npm start
+Remove-Item Env:REPORT_END, Env:LOOKBACK_HOURS, Env:DRY_RUN
+```
 
 ### 로컬 Windows
 
